@@ -72,7 +72,7 @@ struct Caller {
     // Line breaks in `action` are deliberate (see Prompt); clean each line
     var text = (named ?? action)
       .split(separator: "\n", omittingEmptySubsequences: false)
-      .map { Caller.clean(String($0), limit: 90) }.joined(separator: "\n")
+      .map { Caller.clean(String($0), limit: 200) }.joined(separator: "\n")
     // macOS appends a period; a lone "." on its own line looks broken
     while text.hasSuffix("\n") { text.removeLast() }
     return text
@@ -145,13 +145,11 @@ struct Caller {
     return URL(fileURLWithPath: absolute).standardizedFileURL.path
   }
 
-  /// `~/Projects/x`, or `…/parent/x` when long.
+  /// `~/Projects/x`: the full path, never shortened, since the user decides on it.
   static func displayPath(_ path: String) -> String {
-    var path = path
     let home = NSHomeDirectory()
-    if path == home || path.hasPrefix(home + "/") { path = "~" + path.dropFirst(home.count) }
-    let parts = path.split(separator: "/")
-    return path.count > 50 && parts.count > 3 ? "…/" + parts.suffix(3).joined(separator: "/") : path
+    guard path == home || path.hasPrefix(home + "/") else { return path }
+    return "~" + path.dropFirst(home.count)
   }
 
   var gitSubcommand: String? {

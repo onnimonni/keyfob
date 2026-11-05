@@ -46,7 +46,7 @@ enum Prompt {
       key: nil)
   }
 
-  /// `org/repo` from `/org/repo.git`; long absolute paths as `…/a/b/repo`.
+  /// `org/repo` from `/org/repo.git`; absolute paths stay whole.
   private static func repositoryPath(_ path: String) -> String {
     var path = path
     if path.hasSuffix(".git") { path.removeLast(4) }
