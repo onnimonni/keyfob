@@ -16,38 +16,42 @@ enum Prompt {
       key: key.promptLine)
   }
 
-  /// Login over SSH; for git, phrased as the git operation with its remote in
-  /// `git clone` form (`git@github.com:org/repo`).
+  /// Login over SSH; for git, phrased as the git operation with the server
+  /// (`github.com`, `deploy@host:2222`) and repository path on their own lines.
   static func sshLogin(_ caller: Caller, user: String, key: Key) -> String {
-    let endpoint = caller.sshEndpoint
-    // `git@` is implied for git hosting, as in `github.com:org/repo`
+    // `git@` is implied for git hosting
     let login = user == "git" ? "" : "\(user)@"
-    let host = endpoint.map {
+    let host = caller.sshEndpoint.map {
       $0.port == "22" ? "\(login)\($0.host)" : "\(login)\($0.host):\($0.port)"
     }
-    guard let endpoint, var path = caller.sshRemoteRepository else {
+    guard let path = caller.sshRemoteRepository else {
       return lines(
         "log in over SSH", [("🖥️", host), ("🔧", caller.initiatorLabel)], key: key.promptLine)
     }
-    if path.hasSuffix(".git") { path.removeLast(4) }
-    let remote =
-      endpoint.port == "22"
-      ? "\(login)\(endpoint.host):\(path)"
-      : "ssh://\(login)\(endpoint.host):\(endpoint.port)/\(path.drop { $0 == "/" })"
-    let operation = caller.gitSubcommand.map { "git \($0)" } ?? "use Git"
+    let operation = gitTitle(caller) ?? "use Git"
     return lines(
       operation,
-      [("📦", remote)] + pushFacts(caller) + [("📁", caller.repository)],
+      [("🌐", host), ("📦", repositoryPath(path))] + pushFacts(caller)
+        + [("📁", caller.repository)],
       key: key.promptLine)
   }
 
   static func gitCredentials(_ caller: Caller, url: String) -> String {
-    let title = caller.gitSubcommand.map { "git \($0)" } ?? "use Git credentials"
+    let title = gitTitle(caller) ?? "use Git credentials"
+    let remote = URLComponents(string: caller.httpRemote ?? url)
     return lines(
       title,
-      [("📦", GitRepository.shortRemote(caller.httpRemote ?? url))] + pushFacts(caller)
-        + [("📁", caller.repository)],
+      [("🌐", remote?.host), ("📦", remote.map(\.path).flatMap { $0.isEmpty ? nil : repositoryPath($0) })]
+        + pushFacts(caller) + [("📁", caller.repository)],
       key: nil)
+  }
+
+  /// `org/repo` from `/org/repo.git`; long absolute paths as `…/a/b/repo`.
+  private static func repositoryPath(_ path: String) -> String {
+    var path = path
+    if path.hasSuffix(".git") { path.removeLast(4) }
+    if path.hasPrefix("/"), path.split(separator: "/").count <= 2 { path.removeFirst() }
+    return Caller.displayPath(path)
   }
 
   /// `key` is nil when the identity is not one of keyfob's (or not yet known).
@@ -64,12 +68,17 @@ enum Prompt {
       key: key.map(\.promptLine) ?? "🔑 using age-plugin-se key")
   }
 
-  /// Branch and force warning of a `git push`; nothing for other commands.
-  private static func pushFacts(_ caller: Caller) -> [(String, String?)] {
-    [("🌿", caller.push?.branches), ("⚠️", caller.push?.force == true ? "force: may overwrite" : nil)]
+  /// `git push`, `git fetch`, …; a forced push is called out in the title.
+  private static func gitTitle(_ caller: Caller) -> String? {
+    caller.push?.force == true ? "force push❗" : caller.gitSubcommand.map { "git \($0)" }
   }
 
-  /// `title:`, warnings (🚨 dangerous key, ⚠️ force push) right below it so
+  /// Branch of a `git push`; nothing for other commands.
+  private static func pushFacts(_ caller: Caller) -> [(String, String?)] {
+    [("🌿", caller.push?.branches)]
+  }
+
+  /// `title:`, warnings (🚨 dangerous key) right below it so
   /// they cannot be missed, then the facts, then any other key line.
   static func lines(_ title: String, _ facts: [(String, String?)], key: String?) -> String {
     let present = facts.compactMap { icon, value in value.map { "\(icon) \($0)" } }
@@ -78,6 +87,8 @@ enum Prompt {
     let isWarning = { (line: String) in line.hasPrefix("🚨") || line.hasPrefix("⚠️") }
     let warnings = all.filter(isWarning)
     let rest = present.filter { !isWarning($0) } + [key].compactMap { $0 }.filter { !isWarning($0) }
-    return ([title + ":"] + warnings + rest).joined(separator: "\n")
+    // An emoji already ends the sentence, and a colon after it wraps the line
+    let heading = title.hasSuffix("❗") ? title : title + ":"
+    return ([heading] + warnings + rest).joined(separator: "\n")
   }
 }

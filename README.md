@@ -104,15 +104,16 @@ claude is trying to sign a Git commit:
 📁 ~/Projects/demo-repo
 📦 github.com:onnimonni/demo-repo.
 
-iTerm is trying to git push:
+iTerm is trying to force push❗
 🚨 using dangerous 'prod' key
-⚠️ force: may overwrite
-📦 github.com:org/repo
+🌐 github.com
+📦 org/repo
 🌿 main
 📁 ~/Projects/repo.
 
 claude is trying to git fetch:
-📦 github.com/org/repo
+🌐 github.com
+📦 org/repo
 📁 ~/Projects/repo.
 
 iTerm is trying to decrypt a file using age:
