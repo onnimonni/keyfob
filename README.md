@@ -69,11 +69,31 @@ keyfob install-launch-agent       write a LaunchAgent that runs the SSH agent
 keyfob git-credential get|store|erase
 ```
 
-Every Touch ID sheet names the action and the calling process, e.g.
-_"keyfob is trying to let Claude Code sign a Git commit in ⏎ ~/Projects/app."_
-or _"keyfob is trying to let iTerm unlock Git credentials for github.com via git push."_
-Each request, its outcome and the full process chain (pids and command lines)
-is appended to `~/Library/Logs/keyfob.log`.
+Every Touch ID sheet is titled with the requesting app and says what is being
+unlocked:
+
+```
+Claude Code is trying to sign a Git commit:
+'Add login rate limiting'
+in:
+'~/Projects/demo-repo'.
+
+iTerm is trying to log in over SSH to:
+'git@github.com:22'
+for:
+'/org/repo.git'
+via git push.
+
+Claude Code is trying to decrypt with age:
+'~/.dotfiles/secrets/secrets.yaml'
+via sops.
+```
+
+macOS titles the sheet with the executable's file name, so keyfob runs a copy of
+itself named after the app (`~/.config/keyfob/bin/<App>`). That title is
+cosmetic: any program can name its executable anything. The real story is in
+`~/Library/Logs/keyfob.log`, which records each request, its outcome and the
+full process chain (pids and command lines).
 
 `keyfob init` writes into `~/.config/keyfob` (`$KEYFOB_HOME` overrides):
 
