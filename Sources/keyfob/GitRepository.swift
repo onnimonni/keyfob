@@ -1,8 +1,9 @@
 import Foundation
 
-/// Origin of a work tree, read from the files in `.git` (keyfob does not run
-/// git). Handles linked worktrees, whose `.git` is a file.
+/// Current branch and origin of a work tree, read from the files in `.git`
+/// (keyfob does not run git). Handles linked worktrees, whose `.git` is a file.
 struct GitRepository {
+  let branch: String?
   let origin: String?
 
   init?(workTree: String) {
@@ -25,6 +26,12 @@ struct GitRepository {
       directory.deleteLastPathComponent()
     }
     guard let gitDirectory else { return nil }
+
+    let head = try? String(contentsOf: gitDirectory.appendingPathComponent("HEAD"), encoding: .utf8)
+    branch = head.flatMap {
+      let ref = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+      return ref.hasPrefix("ref: refs/heads/") ? String(ref.dropFirst(16)) : nil
+    }
 
     // Linked worktrees keep config in the common directory
     var common = gitDirectory

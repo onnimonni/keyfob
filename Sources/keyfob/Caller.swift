@@ -160,6 +160,48 @@ struct Caller {
     }
   }
 
+  /// What `git push` updates: the destinations of its refspecs
+  /// (`git push origin HEAD:main` → `main`), else the current branch, and
+  /// whether it is forced (`--force`, `--force-with-lease`, `+refspec`).
+  var push: (branches: String?, force: Bool)? {
+    guard let push = chain.first(where: { $0.gitSubcommand == "push" }) else { return nil }
+    var arguments = push.arguments.dropFirst()
+    arguments = arguments.drop { $0 != "push" }.dropFirst()  // skip `git -C dir -c x=y`
+    let valueOptions: Set<String> = ["--repo", "-o", "--push-option", "--receive-pack", "--exec"]
+    var operands: [String] = []
+    var force = false
+    var skipNext = false
+    for argument in arguments {
+      if skipNext {
+        skipNext = false
+      } else if valueOptions.contains(argument) {
+        skipNext = true
+      } else if argument.hasPrefix("-") {
+        if ["-f", "--force"].contains(argument) || argument.hasPrefix("--force-with-lease") {
+          force = true
+        }
+        if ["--all", "--mirror", "--tags"].contains(argument) { operands.append(argument) }
+      } else {
+        operands.append(argument)
+      }
+    }
+    // The first operand is the remote, unless only flags like --all were given
+    let refspecs = operands.first?.hasPrefix("--") == true ? operands : Array(operands.dropFirst())
+    var branches = refspecs.map { refspec -> String in
+      if refspec.hasPrefix("+") { force = true }
+      let destination = refspec.split(separator: ":", omittingEmptySubsequences: false).last
+        .map(String.init) ?? refspec
+      return destination.replacingOccurrences(of: "refs/heads/", with: "")
+        .trimmingCharacters(in: CharacterSet(charactersIn: "+"))
+    }.joined(separator: ", ")
+    if branches.isEmpty,
+      let current = push.workingDirectory.flatMap(GitRepository.init(workTree:))?.branch
+    {
+      branches = current
+    }
+    return (branches.isEmpty ? nil : branches, force)
+  }
+
   /// Host and port from `ssh -o … -p 2222 git@github.com git-upload-pack '…'`.
   var sshEndpoint: (host: String, port: String)? {
     let options: Set<String> = [

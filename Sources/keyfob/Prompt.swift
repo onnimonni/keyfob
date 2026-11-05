@@ -36,14 +36,19 @@ enum Prompt {
       : "ssh://\(login)\(endpoint.host):\(endpoint.port)/\(path.drop { $0 == "/" })"
     let operation = caller.gitSubcommand.map { "git \($0)" } ?? "use Git"
     return lines(
-      "\(operation) over SSH", [("📦", remote), ("📁", caller.repository)], key: key.promptLine)
+      operation,
+      [("📦", remote), ("🌿", caller.push?.branches), ("🚨", caller.push?.force == true ? "force push: may overwrite history" : nil), ("📁", caller.repository)],
+      key: key.promptLine)
   }
 
   static func gitCredentials(_ caller: Caller, url: String) -> String {
-    let title = caller.gitSubcommand.map { "git \($0) over HTTPS" } ?? "use Git credentials"
+    let title = caller.gitSubcommand.map { "git \($0)" } ?? "use Git credentials"
     return lines(
       title,
-      [("📦", GitRepository.shortRemote(caller.httpRemote ?? url)), ("📁", caller.repository)],
+      [
+        ("📦", GitRepository.shortRemote(caller.httpRemote ?? url)),
+        ("🌿", caller.push?.branches), ("🚨", caller.push?.force == true ? "force push: may overwrite history" : nil), ("📁", caller.repository),
+      ],
       key: nil)
   }
 

@@ -104,12 +104,14 @@ claude is trying to sign a Git commit:
 📁 ~/Projects/demo-repo
 📦 github.com:onnimonni/demo-repo.
 
-iTerm is trying to git push over SSH:
+iTerm is trying to git push:
 📦 github.com:org/repo
+🌿 main
+🚨 force push: may overwrite history
 📁 ~/Projects/repo
 🚨 using your dangerous 'prod' SSH key.
 
-claude is trying to git fetch over HTTPS:
+claude is trying to git fetch:
 📦 github.com/org/repo
 📁 ~/Projects/repo.
 
