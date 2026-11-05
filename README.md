@@ -29,7 +29,7 @@ credentials key. Add more with `keyfob new ssh|age NAME [--dangerous]`:
 | Unlock | Touch ID or password | Touch ID only |
 | SSH agent | one approval covers 5 minutes per app and key | every use |
 | Fingerprints change | key keeps working | key is destroyed |
-| Touch ID sheet | names the key unless it is `default` | 🚨 names the key |
+| Touch ID sheet | names the key unless it is `default` | 🚨 names the key, right under the title |
 
 The git credentials key is Touch ID only and survives fingerprint changes.
 
@@ -105,11 +105,11 @@ claude is trying to sign a Git commit:
 📦 github.com:onnimonni/demo-repo.
 
 iTerm is trying to git push:
+🚨 using dangerous 'prod' key
+⚠️ force: may overwrite
 📦 github.com:org/repo
 🌿 main
-🚨 force push: may overwrite history
-📁 ~/Projects/repo
-🚨 using your dangerous 'prod' SSH key.
+📁 ~/Projects/repo.
 
 claude is trying to git fetch:
 📦 github.com/org/repo

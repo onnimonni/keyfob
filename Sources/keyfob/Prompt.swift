@@ -37,7 +37,7 @@ enum Prompt {
     let operation = caller.gitSubcommand.map { "git \($0)" } ?? "use Git"
     return lines(
       operation,
-      [("📦", remote), ("🌿", caller.push?.branches), ("🚨", caller.push?.force == true ? "force push: may overwrite history" : nil), ("📁", caller.repository)],
+      [("📦", remote)] + pushFacts(caller) + [("📁", caller.repository)],
       key: key.promptLine)
   }
 
@@ -45,10 +45,8 @@ enum Prompt {
     let title = caller.gitSubcommand.map { "git \($0)" } ?? "use Git credentials"
     return lines(
       title,
-      [
-        ("📦", GitRepository.shortRemote(caller.httpRemote ?? url)),
-        ("🌿", caller.push?.branches), ("🚨", caller.push?.force == true ? "force push: may overwrite history" : nil), ("📁", caller.repository),
-      ],
+      [("📦", GitRepository.shortRemote(caller.httpRemote ?? url))] + pushFacts(caller)
+        + [("📁", caller.repository)],
       key: nil)
   }
 
@@ -63,13 +61,23 @@ enum Prompt {
     return lines(
       "decrypt a file using age",
       [("📄", file), ("📁", directory.map(Caller.displayPath)), ("🔧", tool)],
-      key: key.map(\.promptLine) ?? "🔑 using an age-plugin-se key")
+      key: key.map(\.promptLine) ?? "🔑 using age-plugin-se key")
   }
 
-  /// `title:`, the present facts, then the key line if any.
+  /// Branch and force warning of a `git push`; nothing for other commands.
+  private static func pushFacts(_ caller: Caller) -> [(String, String?)] {
+    [("🌿", caller.push?.branches), ("⚠️", caller.push?.force == true ? "force: may overwrite" : nil)]
+  }
+
+  /// `title:`, warnings (🚨 dangerous key, ⚠️ force push) right below it so
+  /// they cannot be missed, then the facts, then any other key line.
   static func lines(_ title: String, _ facts: [(String, String?)], key: String?) -> String {
     let present = facts.compactMap { icon, value in value.map { "\(icon) \($0)" } }
-    guard !present.isEmpty || key != nil else { return title }
-    return ([title + ":"] + present + [key].compactMap { $0 }).joined(separator: "\n")
+    let all = [key].compactMap { $0 } + present
+    guard !all.isEmpty else { return title }
+    let isWarning = { (line: String) in line.hasPrefix("🚨") || line.hasPrefix("⚠️") }
+    let warnings = all.filter(isWarning)
+    let rest = present.filter { !isWarning($0) } + [key].compactMap { $0 }.filter { !isWarning($0) }
+    return ([title + ":"] + warnings + rest).joined(separator: "\n")
   }
 }

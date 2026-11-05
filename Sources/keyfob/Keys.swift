@@ -110,8 +110,8 @@ struct Key {
 
   /// Last line of the Touch ID sheet; nothing for the everyday `default` key.
   var promptLine: String? {
-    if isDangerous { return "🚨 using your dangerous '\(name)' \(kind.label) key" }
-    return name == Key.defaultName ? nil : "🔑 using your '\(name)' \(kind.label) key"
+    if isDangerous { return "🚨 using dangerous '\(name)' key" }
+    return name == Key.defaultName ? nil : "🔑 using '\(name)' key"
   }
 
   static func all(_ kind: Kind) -> [Key] {
