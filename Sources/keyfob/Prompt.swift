@@ -31,8 +31,8 @@ enum Prompt {
     let operation = gitTitle(caller) ?? "use Git"
     return lines(
       operation,
-      [("🌐", host), ("📦", repositoryPath(path))] + pushFacts(caller)
-        + [("📁", caller.repository)],
+      [("🌐", host), ("📦", repositoryPath(path)), ("📁", caller.repository)]
+        + pushFacts(caller),
       key: key.promptLine)
   }
 
@@ -42,7 +42,7 @@ enum Prompt {
     return lines(
       title,
       [("🌐", remote?.host), ("📦", remote.map(\.path).flatMap { $0.isEmpty ? nil : repositoryPath($0) })]
-        + pushFacts(caller) + [("📁", caller.repository)],
+        + [("📁", caller.repository)] + pushFacts(caller),
       key: nil)
   }
 
@@ -75,18 +75,20 @@ enum Prompt {
 
   /// Force warning and branch of a `git push`; nothing for other commands.
   private static func pushFacts(_ caller: Caller) -> [(String, String?)] {
-    [("‼️", caller.push?.force == true ? "may rewrite history" : nil), ("🌿", caller.push?.branches)]
+    [("🌿", caller.push?.branches), ("‼️", caller.push?.force == true ? "may rewrite history" : nil)]
   }
 
-  /// `title:`, warnings (🚨 dangerous key, ‼️ force push) right below it so
-  /// they cannot be missed, then the facts, then any other key line.
+  /// `title:`, a 🚨 dangerous key right below it so it cannot be missed, the
+  /// facts, any other key line, then the push branch and force warning last.
   static func lines(_ title: String, _ facts: [(String, String?)], key: String?) -> String {
     let present = facts.compactMap { icon, value in value.map { "\(icon) \($0)" } }
-    let all = [key].compactMap { $0 } + present
-    guard !all.isEmpty else { return title }
-    let isWarning = { (line: String) in line.hasPrefix("🚨") || line.hasPrefix("‼️") }
-    let warnings = all.filter(isWarning)
-    let rest = present.filter { !isWarning($0) } + [key].compactMap { $0 }.filter { !isWarning($0) }
-    return ([title + ":"] + warnings + rest).joined(separator: "\n")
+    let keyLines = [key].compactMap { $0 }
+    let isTrailing = { (line: String) in line.hasPrefix("🌿") || line.hasPrefix("‼️") }
+    let ordered =
+      keyLines.filter { $0.hasPrefix("🚨") }
+      + present.filter { !isTrailing($0) }
+      + keyLines.filter { !$0.hasPrefix("🚨") }
+      + present.filter(isTrailing)
+    return ordered.isEmpty ? title : ([title + ":"] + ordered).joined(separator: "\n")
   }
 }

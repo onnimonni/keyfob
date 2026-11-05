@@ -106,11 +106,11 @@ claude is trying to sign a Git commit:
 
 iTerm is trying to FORCE push:
 🚨 using dangerous 'prod' key
-‼️ may rewrite history
 🌐 github.com
 📦 org/repo
+📁 ~/Projects/repo
 🌿 main
-📁 ~/Projects/repo.
+‼️ may rewrite history.
 
 claude is trying to git fetch:
 🌐 github.com
