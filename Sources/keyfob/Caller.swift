@@ -64,19 +64,23 @@ struct Caller {
 
   // MARK: What the user sees
 
-  /// Text for the Touch ID sheet. macOS always starts it with the name of the
-  /// process holding the key, so the app goes first after that:
-  /// "keyfob is trying to let Claude Code sign a Git commit in ~/Projects/x\nvia git commit."
-  func reason(_ action: String) -> String {
+  /// Text for the Touch ID sheet. macOS starts it with the executable's name
+  /// (`speaker`). When that is already the app (see Persona) the action follows
+  /// directly, else the app is named: "keyfob is trying to let iTerm sign …".
+  func reason(_ action: String, speaker: String = Persona.currentName) -> String {
+    let named = app.map { Persona.fileName($0) == speaker ? action : "let \($0) \(action)" }
     // `action` may hold a deliberate line break (before a path); keep only those
-    var text = (app.map { "let \($0) \(action)" } ?? action)
-      .split(separator: "\n").map { Caller.clean(String($0), limit: 90) }.joined(separator: "\n")
+    var text = (named ?? action)
+      .split(separator: "\n", omittingEmptySubsequences: false)
+      .map { Caller.clean(String($0), limit: 90) }.joined(separator: "\n")
     if let command = initiator.map(Caller.label),
       command.lowercased() != app?.lowercased(),
       !action.contains(command.split(separator: " ").last.map(String.init) ?? command)
     {
-      text += "\nvia " + Caller.clean(command)
+      text += (text.hasSuffix("\n") ? "" : "\n") + "via " + Caller.clean(command)
     }
+    // macOS appends a period; a lone "." on its own line looks broken
+    while text.hasSuffix("\n") { text.removeLast() }
     return text
   }
 
@@ -93,9 +97,18 @@ struct Caller {
   }
 
   /// The command the user actually ran: the nearest process that is not a
-  /// shell, wrapper or helper.
+  /// shell, wrapper or helper, looking no further than the app or the
+  /// terminal login that started it.
   var initiator: Process? {
-    chain.first { !Caller.isPlumbing($0) && Caller.agentName($0) == nil }
+    for process in chain {
+      if Caller.agentName(process) != nil || Caller.bundleName(process) != nil
+        || process.name == "login"
+      {
+        return nil
+      }
+      if !Caller.isPlumbing(process) { return process }
+    }
+    return nil
   }
 
   /// Where it ran: a coding agent if one is in the chain, else the app bundle
@@ -105,41 +118,76 @@ struct Caller {
       ?? chain.lazy.compactMap(Caller.bundleName).first
   }
 
-  /// Repository the git operation runs in (git chdirs to the work tree),
-  /// as `~/Projects/x`, or `…/parent/x` when long.
+  /// Repository the git operation runs in (git chdirs to the work tree).
   var repository: String? {
-    guard var path = chain.first(where: { $0.name.hasPrefix("git") })?.workingDirectory else {
-      return nil
-    }
+    chain.first(where: { $0.name.hasPrefix("git") })?.workingDirectory.map(Caller.displayPath)
+  }
+
+  /// Directory the initiating command runs in (the project for sops/age).
+  var initiatorDirectory: String? {
+    initiator?.workingDirectory.map(Caller.displayPath)
+  }
+
+  /// File named last on the initiator's command line, resolved against its
+  /// working directory: `sops -d secrets/x.yaml` → `~/.dotfiles/secrets/x.yaml`.
+  var targetFile: String? {
+    let valueOptions: Set<String> = [
+      "-i", "-o", "-r", "-R", "--identity", "--output", "--recipient", "--recipients-file",
+      "--input-type", "--output-type", "--config",
+    ]
+    guard let initiator, initiator.arguments.count > 1,
+      let last = initiator.arguments.last, !last.hasPrefix("-"),
+      !valueOptions.contains(initiator.arguments[initiator.arguments.count - 2])
+    else { return nil }
+    let absolute =
+      last.hasPrefix("/") ? last : (initiator.workingDirectory.map { "\($0)/\(last)" } ?? last)
+    return Caller.displayPath(URL(fileURLWithPath: absolute).standardizedFileURL.path)
+  }
+
+  /// `~/Projects/x`, or `…/parent/x` when long.
+  static func displayPath(_ path: String) -> String {
+    var path = path
     let home = NSHomeDirectory()
     if path == home || path.hasPrefix(home + "/") { path = "~" + path.dropFirst(home.count) }
     let parts = path.split(separator: "/")
-    return path.count > 40 && parts.count > 2 ? "…/" + parts.suffix(2).joined(separator: "/") : path
+    return path.count > 50 && parts.count > 3 ? "…/" + parts.suffix(3).joined(separator: "/") : path
   }
 
   var gitSubcommand: String? {
     chain.lazy.compactMap(\.gitSubcommand).first { !$0.hasPrefix("credential") }
   }
 
-  /// `github.com` from `ssh -o … git@github.com git-upload-pack '…'`
-  var sshHost: String? {
+  /// `git@github.com:22` from `ssh -o … -p 22 git@github.com git-upload-pack '…'`.
+  /// `user` is the one from the signed login request, which is authoritative.
+  func sshTarget(user: String) -> String? {
     let options: Set<String> = [
       "-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O",
       "-o", "-P", "-p", "-Q", "-R", "-S", "-W", "-w",
     ]
-    guard let destination = chain.first(where: { $0.name == "ssh" })?
-      .firstOperand(optionsWithValues: options)
+    guard let ssh = chain.first(where: { $0.name == "ssh" }),
+      var host = ssh.firstOperand(optionsWithValues: options)
     else { return nil }
-    let host = destination.split(separator: "@").last.map(String.init) ?? destination
-    return host.hasPrefix("ssh://") ? String(host.dropFirst(6)) : host
+    var port = "22"
+    if let index = ssh.arguments.firstIndex(of: "-p"), index + 1 < ssh.arguments.count {
+      port = ssh.arguments[index + 1]
+    }
+    if host.hasPrefix("ssh://") {
+      host = String(host.dropFirst(6).prefix { $0 != "/" })
+      if let colon = host.lastIndex(of: ":") {
+        port = String(host[host.index(after: colon)...])
+        host = String(host[..<colon])
+      }
+    }
+    host = host.split(separator: "@").last.map(String.init) ?? host
+    return "\(user)@\(host):\(port)"
   }
 
-  /// File named last on the initiator's command line (`sops -d secrets.yaml`).
-  var targetFile: String? {
-    guard let last = initiator?.arguments.dropFirst().last, !last.hasPrefix("-") else {
-      return nil
-    }
-    return URL(fileURLWithPath: last).lastPathComponent
+  /// `/org/repo.git` from ssh's remote command `git-receive-pack '/org/repo.git'`.
+  var sshRemoteRepository: String? {
+    guard let command = chain.first(where: { $0.name == "ssh" })?.arguments.last,
+      command.hasPrefix("git-"), let start = command.firstIndex(of: "'")
+    else { return nil }
+    return String(command[command.index(after: start)...].prefix { $0 != "'" })
   }
 
   // MARK: Audit log
@@ -176,7 +224,7 @@ struct Caller {
 
   private static let plumbing: Set<String> = [
     "keyfob", "git-credential-keyfob", "age-plugin-se", "xcrun", "ssh", "ssh-keygen",
-    "timeout", "env", "nice", "sh", "bash", "zsh", "dash", "fish", "login",
+    "timeout", "env", "nice", "coreutils", "sh", "bash", "zsh", "dash", "fish", "login",
   ]
 
   private static func isPlumbing(_ process: Process) -> Bool {
@@ -247,7 +295,7 @@ enum AuditLog {
     let timestamp = ISO8601DateFormatter().string(from: Date())
     let origin = caller.origin.map { " \($0)" } ?? ""
     let line =
-      "\(timestamp) \(outcome) \(Caller.clean(action, limit: 200))\(origin) [\(caller.detail)]\n"
+      "\(timestamp) \(outcome) \(Caller.clean(action.split(separator: "\n").joined(separator: " "), limit: 200))\(origin) [\(caller.detail)]\n"
     let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT, 0o600)
     guard fd >= 0 else { return }
     defer { close(fd) }
@@ -258,5 +306,22 @@ enum AuditLog {
     guard Paths.exists(url) else { return }
     let text = try String(contentsOf: url, encoding: .utf8)
     print(text.split(separator: "\n").suffix(lines).joined(separator: "\n"))
+  }
+}
+
+extension Caller {
+  /// First line of the commit or tag being signed. git hands ssh-keygen the
+  /// object in a temp file (its last argument): headers, blank line, message.
+  var signedSubject: String? {
+    guard let file = chain.first(where: { $0.name == "ssh-keygen" })?.arguments.last,
+      let handle = FileHandle(forReadingAtPath: file),
+      let data = try? handle.read(upToCount: 64 * 1024)
+    else { return nil }
+    let text = String(decoding: data, as: UTF8.self)
+    guard let body = text.range(of: "\n\n") else { return nil }
+    var subject = String(text[body.upperBound...].prefix { $0 != "\n" })
+    while subject.hasSuffix(".") { subject.removeLast() }
+    if subject.count > 50 { subject = subject.prefix(49) + "…" }
+    return subject.isEmpty ? nil : subject
   }
 }

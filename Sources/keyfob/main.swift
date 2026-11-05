@@ -27,9 +27,11 @@ func run(_ arguments: [String]) throws {
 
   switch invokedAs {
   case "git-credential-keyfob":
+    if args.first == "get" { Persona.becomeCallerApp() }
     try GitCredential.run(args.first ?? "")
     return
   case "age-plugin-se", "age-plugin-keyfob":
+    if args.first == "--age-plugin=identity-v1" { Persona.becomeCallerApp() }
     try runAgePlugin(args)
     return
   default:
@@ -60,6 +62,8 @@ func run(_ arguments: [String]) throws {
     try Setup.installLaunchAgent()
   case "git-credential":
     try GitCredential.run(args.dropFirst().first ?? "")
+  case "__sign":
+    try Persona.signChild(reason: args.dropFirst().first ?? "sign")
   case "version", "--version":
     print(version)
   case nil, "help", "--help", "-h":
@@ -72,7 +76,11 @@ func run(_ arguments: [String]) throws {
 /// Touch ID text for age decryption; the parent is age itself or sops.
 enum AgePrompt {
   static let caller = Caller.parent
-  static var action: String { caller.targetFile.map { "decrypt \($0)" } ?? "decrypt a file with age" }
+  static var action: String {
+    caller.targetFile.map { "decrypt with age:\n'\($0)'" }
+      ?? caller.initiatorDirectory.map { "decrypt a file in:\n'\($0)'" }
+      ?? "decrypt a file with age"
+  }
 }
 
 func runAgePlugin(_ args: [String]) throws {
