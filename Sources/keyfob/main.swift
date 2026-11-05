@@ -76,11 +76,7 @@ func run(_ arguments: [String]) throws {
 /// Touch ID text for age decryption; the parent is age itself or sops.
 enum AgePrompt {
   static let caller = Caller.parent
-  static var action: String {
-    caller.targetFile.map { "decrypt with age:\n'\($0)'" }
-      ?? caller.initiatorDirectory.map { "decrypt a file in:\n'\($0)'" }
-      ?? "decrypt a file with age"
-  }
+  static var action: String { Prompt.ageDecrypt(caller) }
 }
 
 func runAgePlugin(_ args: [String]) throws {

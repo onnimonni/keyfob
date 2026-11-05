@@ -22,7 +22,7 @@ enum GitCredential {
     case "get":
       guard Paths.exists(file) else { return }
       let caller = Caller.parent
-      let action = "unlock Git credentials for:\n'\(id)'"
+      let action = Prompt.gitCredentials(caller, url: id)
       let plaintext: Data
       do {
         plaintext = try open(Data(contentsOf: file), id: id, reason: caller.reason(action))

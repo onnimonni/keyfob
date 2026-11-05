@@ -28,8 +28,9 @@ enum Persona {
     return name.hasPrefix(".") ? "_" + name : name
   }
 
-  /// keyfob's copy named `app`: a hard link when on the same volume, else a
-  /// copy (the nix store is its own volume). Refreshed when keyfob changes.
+  /// keyfob's copy named `app`, refreshed when keyfob changes. A real copy
+  /// (an APFS clone, so cheap), not a hard link: hard links share one vnode
+  /// and macOS may title the sheet with whichever name it saw last.
   static func executable(named app: String) throws -> String {
     let source = ownPath
     let target = directory.appendingPathComponent(fileName(app)).path
@@ -40,10 +41,8 @@ enum Persona {
     try Paths.ensureDirectory(directory)
     let temporary = target + ".\(getpid()).tmp"
     unlink(temporary)
-    if link(source, temporary) != 0 {
-      try manager.copyItem(atPath: source, toPath: temporary)
-      try manager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: temporary)
-    }
+    try manager.copyItem(atPath: source, toPath: temporary)
+    try manager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: temporary)
     guard rename(temporary, target) == 0 else {
       unlink(temporary)
       throw KeyfobError("cannot install \(target): \(String(cString: strerror(errno)))")
@@ -56,7 +55,7 @@ enum Persona {
   /// Must run before stdin is read; argv is kept so dispatch still works.
   static func becomeCallerApp() {
     guard ProcessInfo.processInfo.environment["KEYFOB_PERSONA"] == nil,
-      let app = Caller.parent.app,
+      case let app = Caller.parent.displayApp,
       fileName(app) != currentName,
       let path = try? executable(named: app)
     else { return }

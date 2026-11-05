@@ -69,16 +69,10 @@ struct Caller {
   /// directly, else the app is named: "keyfob is trying to let iTerm sign …".
   func reason(_ action: String, speaker: String = Persona.currentName) -> String {
     let named = app.map { Persona.fileName($0) == speaker ? action : "let \($0) \(action)" }
-    // `action` may hold a deliberate line break (before a path); keep only those
+    // Line breaks in `action` are deliberate (see Prompt); clean each line
     var text = (named ?? action)
       .split(separator: "\n", omittingEmptySubsequences: false)
       .map { Caller.clean(String($0), limit: 90) }.joined(separator: "\n")
-    if let command = initiator.map(Caller.label),
-      command.lowercased() != app?.lowercased(),
-      !action.contains(command.split(separator: " ").last.map(String.init) ?? command)
-    {
-      text += (text.hasSuffix("\n") ? "" : "\n") + "via " + Caller.clean(command)
-    }
     // macOS appends a period; a lone "." on its own line looks broken
     while text.hasSuffix("\n") { text.removeLast() }
     return text
@@ -118,10 +112,17 @@ struct Caller {
       ?? chain.lazy.compactMap(Caller.bundleName).first
   }
 
-  /// Repository the git operation runs in (git chdirs to the work tree).
-  var repository: String? {
-    chain.first(where: { $0.name.hasPrefix("git") })?.workingDirectory.map(Caller.displayPath)
+  /// Name the Touch ID sheet is titled with: the app, or `unknown` so an
+  /// unrecognised caller stands out.
+  var displayApp: String { app ?? "unknown" }
+
+  /// Work tree the git operation runs in (git chdirs to it), absolute.
+  var repositoryPath: String? {
+    chain.first(where: { $0.name.hasPrefix("git") })?.workingDirectory
   }
+
+  /// Work tree as `~/Projects/x`.
+  var repository: String? { repositoryPath.map(Caller.displayPath) }
 
   /// Directory the initiating command runs in (the project for sops/age).
   var initiatorDirectory: String? {
@@ -129,7 +130,7 @@ struct Caller {
   }
 
   /// File named last on the initiator's command line, resolved against its
-  /// working directory: `sops -d secrets/x.yaml` → `~/.dotfiles/secrets/x.yaml`.
+  /// working directory: `sops -d secrets/x.yaml` → `/Users/me/.dotfiles/secrets/x.yaml`.
   var targetFile: String? {
     let valueOptions: Set<String> = [
       "-i", "-o", "-r", "-R", "--identity", "--output", "--recipient", "--recipients-file",
@@ -141,7 +142,7 @@ struct Caller {
     else { return nil }
     let absolute =
       last.hasPrefix("/") ? last : (initiator.workingDirectory.map { "\($0)/\(last)" } ?? last)
-    return Caller.displayPath(URL(fileURLWithPath: absolute).standardizedFileURL.path)
+    return URL(fileURLWithPath: absolute).standardizedFileURL.path
   }
 
   /// `~/Projects/x`, or `…/parent/x` when long.
@@ -154,12 +155,13 @@ struct Caller {
   }
 
   var gitSubcommand: String? {
-    chain.lazy.compactMap(\.gitSubcommand).first { !$0.hasPrefix("credential") }
+    chain.lazy.compactMap(\.gitSubcommand).first {
+      !$0.hasPrefix("credential") && !$0.hasPrefix("remote-")
+    }
   }
 
-  /// `git@github.com:22` from `ssh -o … -p 22 git@github.com git-upload-pack '…'`.
-  /// `user` is the one from the signed login request, which is authoritative.
-  func sshTarget(user: String) -> String? {
+  /// Host and port from `ssh -o … -p 2222 git@github.com git-upload-pack '…'`.
+  var sshEndpoint: (host: String, port: String)? {
     let options: Set<String> = [
       "-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O",
       "-o", "-P", "-p", "-Q", "-R", "-S", "-W", "-w",
@@ -179,7 +181,18 @@ struct Caller {
       }
     }
     host = host.split(separator: "@").last.map(String.init) ?? host
-    return "\(user)@\(host):\(port)"
+    return (host, port)
+  }
+
+  /// URL git is talking to, from `git-remote-https origin https://…`, without
+  /// any userinfo.
+  var httpRemote: String? {
+    guard let remote = chain.first(where: { $0.name.hasPrefix("git-remote-") }),
+      remote.arguments.count > 2, var url = URLComponents(string: remote.arguments[2])
+    else { return nil }
+    url.user = nil
+    url.password = nil
+    return url.string
   }
 
   /// `/org/repo.git` from ssh's remote command `git-receive-pack '/org/repo.git'`.
@@ -203,13 +216,13 @@ struct Caller {
 
   // MARK: Helpers
 
-  private static let agents = [
-    "claude": "Claude Code", "codex": "Codex", "gemini": "Gemini CLI",
-    "cursor-agent": "Cursor Agent", "opencode": "opencode", "aider": "aider",
+  /// Coding agents, shown by their command name (`claude`, `codex`, …)
+  private static let agents: Set<String> = [
+    "claude", "codex", "gemini", "cursor-agent", "opencode", "aider", "amp",
   ]
 
   private static func agentName(_ process: Process) -> String? {
-    agents[process.name]
+    agents.contains(process.name) ? process.name : nil
   }
 
   /// Outermost .app in the executable path, so helpers map to their product.
@@ -217,6 +230,9 @@ struct Caller {
     guard let range = process.path.range(of: ".app/") else { return nil }
     return URL(fileURLWithPath: String(process.path[..<range.lowerBound])).lastPathComponent
   }
+
+  /// `git push`, `sops`, …
+  var initiatorLabel: String? { initiator.map(Caller.label) }
 
   private static func label(_ process: Process) -> String {
     process.gitSubcommand.map { "git \($0)" } ?? process.name

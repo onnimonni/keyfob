@@ -97,14 +97,9 @@ final class SSHAgent {
         signLock.lock()
         defer { signLock.unlock() }
         do {
-          let signature =
-            if let app = peer.app {
-              try Persona.sign(
-                data, reason: peer.reason(action, speaker: Persona.fileName(app)), as: app)
-            } else {
-              try SecureEnclaveKeys.loadSigningKey(reason: peer.reason(action))
-                .signature(for: data)
-            }
+          let app = peer.displayApp
+          let signature = try Persona.sign(
+            data, reason: peer.reason(action, speaker: Persona.fileName(app)), as: app)
           AuditLog.record(action, caller: peer, outcome: "allowed")
 
           var writer = SSHWriter()
@@ -190,10 +185,7 @@ enum SignReason {
       var reader = SSHReader(data.dropFirst(6))
       let namespace = (try? reader.text()) ?? ""
       guard namespace == "git" else { return "sign data for \(namespace)" }
-      var action = caller.gitSubcommand == "tag" ? "sign a Git tag" : "sign a Git commit"
-      if let subject = caller.signedSubject { action += ":\n'\(subject)'" }
-      if let repository = caller.repository { action += "\nin:\n'\(repository)'" }
-      return action
+      return Prompt.gitSigning(caller, tag: caller.gitSubcommand == "tag")
     }
 
     // SSH_MSG_USERAUTH_REQUEST publickey signature
@@ -201,10 +193,7 @@ enum SignReason {
     if (try? reader.string()) != nil, (try? reader.byte()) == 50,
       let user = try? reader.text()
     {
-      guard let target = caller.sshTarget(user: user) else { return "log in over SSH as \(user)" }
-      var action = "log in over SSH to:\n'\(target)'"
-      if let repository = caller.sshRemoteRepository { action += "\nfor:\n'\(repository)'" }
-      return action
+      return Prompt.sshLogin(caller, user: user)
     }
     return "sign SSH data"
   }
