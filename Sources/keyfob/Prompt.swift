@@ -70,25 +70,23 @@ enum Prompt {
 
   /// `git push`, `git fetch`, …; a forced push is called out in the title.
   private static func gitTitle(_ caller: Caller) -> String? {
-    caller.push?.force == true ? "force push" : caller.gitSubcommand.map { "git \($0)" }
+    caller.push?.force == true ? "FORCE push" : caller.gitSubcommand.map { "git \($0)" }
   }
 
-  /// Branch of a `git push`; nothing for other commands.
+  /// Force warning and branch of a `git push`; nothing for other commands.
   private static func pushFacts(_ caller: Caller) -> [(String, String?)] {
-    [("🌿", caller.push?.branches)]
+    [("‼️", caller.push?.force == true ? "may rewrite history" : nil), ("🌿", caller.push?.branches)]
   }
 
-  /// `title:`, warnings (🚨 dangerous key) right below it so
+  /// `title:`, warnings (🚨 dangerous key, ‼️ force push) right below it so
   /// they cannot be missed, then the facts, then any other key line.
   static func lines(_ title: String, _ facts: [(String, String?)], key: String?) -> String {
     let present = facts.compactMap { icon, value in value.map { "\(icon) \($0)" } }
     let all = [key].compactMap { $0 } + present
     guard !all.isEmpty else { return title }
-    let isWarning = { (line: String) in line.hasPrefix("🚨") || line.hasPrefix("⚠️") }
+    let isWarning = { (line: String) in line.hasPrefix("🚨") || line.hasPrefix("‼️") }
     let warnings = all.filter(isWarning)
     let rest = present.filter { !isWarning($0) } + [key].compactMap { $0 }.filter { !isWarning($0) }
-    // An emoji already ends the sentence, and a colon after it wraps the line
-    let heading = title.hasSuffix("❗") ? title : title + ":"
-    return ([heading] + warnings + rest).joined(separator: "\n")
+    return ([title + ":"] + warnings + rest).joined(separator: "\n")
   }
 }
