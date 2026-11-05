@@ -68,7 +68,9 @@ struct Caller {
   /// process holding the key, so the app goes first after that:
   /// "keyfob is trying to let Claude Code sign a Git commit in ~/Projects/x\nvia git commit."
   func reason(_ action: String) -> String {
-    var text = Caller.clean(app.map { "let \($0) \(action)" } ?? action, limit: 90)
+    // `action` may hold a deliberate line break (before a path); keep only those
+    var text = (app.map { "let \($0) \(action)" } ?? action)
+      .split(separator: "\n").map { Caller.clean(String($0), limit: 90) }.joined(separator: "\n")
     if let command = initiator.map(Caller.label),
       command.lowercased() != app?.lowercased(),
       !action.contains(command.split(separator: " ").last.map(String.init) ?? command)

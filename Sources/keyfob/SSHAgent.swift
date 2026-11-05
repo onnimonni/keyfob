@@ -185,7 +185,7 @@ enum SignReason {
       let namespace = (try? reader.text()) ?? ""
       guard namespace == "git" else { return "sign data for \(namespace)" }
       let what = caller.gitSubcommand == "tag" ? "a Git tag" : "a Git commit"
-      return caller.repository.map { "sign \(what) in \($0)" } ?? "sign \(what)"
+      return caller.repository.map { "sign \(what) in\n\($0)" } ?? "sign \(what)"
     }
 
     // SSH_MSG_USERAUTH_REQUEST publickey signature
