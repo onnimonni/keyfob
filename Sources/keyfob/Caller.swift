@@ -64,11 +64,18 @@ struct Caller {
 
   // MARK: What the user sees
 
-  /// Two lines for the Touch ID sheet, which renders as
-  /// "keyfob is trying to <action>\n<origin>."
+  /// Text for the Touch ID sheet. macOS always starts it with the name of the
+  /// process holding the key, so the app goes first after that:
+  /// "keyfob is trying to let Claude Code sign a Git commit in ~/Projects/x\nvia git commit."
   func reason(_ action: String) -> String {
-    guard let origin else { return Caller.clean(action) }
-    return Caller.clean(action) + "\n" + Caller.clean(origin)
+    var text = Caller.clean(app.map { "let \($0) \(action)" } ?? action, limit: 90)
+    if let command = initiator.map(Caller.label),
+      command.lowercased() != app?.lowercased(),
+      !action.contains(command.split(separator: " ").last.map(String.init) ?? command)
+    {
+      text += "\nvia " + Caller.clean(command)
+    }
+    return text
   }
 
   /// `for git push in Claude Code`
@@ -96,10 +103,16 @@ struct Caller {
       ?? chain.lazy.compactMap(Caller.bundleName).first
   }
 
-  /// Repository the git operation runs in (git chdirs to the work tree).
+  /// Repository the git operation runs in (git chdirs to the work tree),
+  /// as `~/Projects/x`, or `…/parent/x` when long.
   var repository: String? {
-    chain.first { $0.name.hasPrefix("git") }?.workingDirectory
-      .map { URL(fileURLWithPath: $0).lastPathComponent }
+    guard var path = chain.first(where: { $0.name.hasPrefix("git") })?.workingDirectory else {
+      return nil
+    }
+    let home = NSHomeDirectory()
+    if path == home || path.hasPrefix(home + "/") { path = "~" + path.dropFirst(home.count) }
+    let parts = path.split(separator: "/")
+    return path.count > 40 && parts.count > 2 ? "…/" + parts.suffix(2).joined(separator: "/") : path
   }
 
   var gitSubcommand: String? {

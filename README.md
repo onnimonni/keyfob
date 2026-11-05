@@ -70,7 +70,8 @@ keyfob git-credential get|store|erase
 ```
 
 Every Touch ID sheet names the action and the calling process, e.g.
-_"keyfob is trying to sign a git commit or tag (ssh-keygen ← git commit)"_.
+_"keyfob is trying to let Claude Code sign a Git commit in ~/Projects/app."_
+or _"keyfob is trying to let iTerm unlock Git credentials for github.com via git push."_
 Each request, its outcome and the full process chain (pids and command lines)
 is appended to `~/Library/Logs/keyfob.log`.
 
