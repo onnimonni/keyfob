@@ -104,7 +104,7 @@ claude is trying to sign a Git commit:
 📁 ~/Projects/demo-repo
 📦 github.com:onnimonni/demo-repo.
 
-iTerm is trying to force push❗
+iTerm is trying to force push
 🚨 using dangerous 'prod' key
 🌐 github.com
 📦 org/repo

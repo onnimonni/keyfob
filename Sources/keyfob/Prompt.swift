@@ -70,7 +70,7 @@ enum Prompt {
 
   /// `git push`, `git fetch`, …; a forced push is called out in the title.
   private static func gitTitle(_ caller: Caller) -> String? {
-    caller.push?.force == true ? "force push❗" : caller.gitSubcommand.map { "git \($0)" }
+    caller.push?.force == true ? "force push" : caller.gitSubcommand.map { "git \($0)" }
   }
 
   /// Branch of a `git push`; nothing for other commands.
