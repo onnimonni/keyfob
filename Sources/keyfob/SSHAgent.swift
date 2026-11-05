@@ -75,6 +75,10 @@ final class SSHAgent {
         close(client)
         continue
       }
+      // Clients send their next message promptly (ssh connects per auth);
+      // an idle or stalled one must not hold a connection slot forever
+      SSHAgent.setTimeout(client, SO_RCVTIMEO, seconds: 120)
+      SSHAgent.setTimeout(client, SO_SNDTIMEO, seconds: 30)
       Thread.detachNewThread { [self] in
         serve(client)
         close(client)
@@ -171,6 +175,11 @@ final class SSHAgent {
   }
 
   private func failure() -> Data { Data([Message.failure.rawValue]) }
+
+  private static func setTimeout(_ fd: Int32, _ option: Int32, seconds: Int) {
+    var timeout = timeval(tv_sec: seconds, tv_usec: 0)
+    setsockopt(fd, SOL_SOCKET, option, &timeout, socklen_t(MemoryLayout<timeval>.size))
+  }
 
   private func readMessage(_ fd: Int32) -> Data? {
     guard let header = readExactly(fd, 4) else { return nil }

@@ -113,12 +113,12 @@ class Plugin {
 
     // Phase 1
     loop: while true {
-      let stanza = try! Stanza.readFrom(stream: stream)
+      let stanza = Stanza.readOrExit(from: stream)
       switch stanza.type {
       case "add-recipient":
-        recipients.append(stanza.args[0])
+        recipients.append(stanza.requiredArgument())
       case "add-identity":
-        identities.append(stanza.args[0])
+        identities.append(stanza.requiredArgument())
       case "wrap-file-key":
         fileKeys.append(stanza.body)
       case "done":
@@ -237,7 +237,7 @@ class Plugin {
     }
     for stanza in (errors.isEmpty ? stanzas : errors) {
       stanza.writeTo(stream: stream)
-      let resp = try! Stanza.readFrom(stream: stream)
+      let resp = Stanza.readOrExit(from: stream)
       assert(resp.type == "ok")
     }
     Stanza(type: "done").writeTo(stream: stream)
@@ -248,11 +248,15 @@ class Plugin {
     var identities: [String] = []
     var recipientStanzas: [Stanza] = []
     loop: while true {
-      let stanza = try! Stanza.readFrom(stream: stream)
+      let stanza = Stanza.readOrExit(from: stream)
       switch stanza.type {
       case "add-identity":
-        identities.append(stanza.args[0])
+        identities.append(stanza.requiredArgument())
       case "recipient-stanza":
+        // keyfob: phase 2 indexes args[0...1] and parses args[0] as a number
+        guard stanza.args.count >= 2, Int(stanza.args[0]) != nil else {
+          Stanza.exitMalformed()
+        }
         recipientStanzas.append(stanza)
       case "done":
         break loop
@@ -402,7 +406,7 @@ class Plugin {
           } catch {
             Stanza(type: "msg", body: Data(error.localizedDescription.utf8)).writeTo(
               stream: stream)
-            let resp = try! Stanza.readFrom(stream: self.stream)
+            let resp = Stanza.readOrExit(from: self.stream)
             assert(resp.type == "ok")
             // continue
           }
@@ -413,7 +417,7 @@ class Plugin {
     let responses = fileResponses.keys.sorted().map({ k in fileResponses[k]! })
     for stanza in (errors.isEmpty ? responses : errors) {
       stanza.writeTo(stream: stream)
-      let resp = try! Stanza.readFrom(stream: stream)
+      let resp = Stanza.readOrExit(from: stream)
       assert(resp.type == "ok")
     }
     Stanza(type: "done").writeTo(stream: stream)
@@ -677,5 +681,24 @@ struct Identity {
         + Data([UInt8(mlkemdata.count >> 8), UInt8(mlkemdata.count & 0xFF)]) + mlkemdata
     }
     return Bech32().encode(hrp: "AGE-PLUGIN-SE-", data: data)
+  }
+}
+
+// keyfob: malformed plugin input ends the plugin with an error message
+// instead of crashing on try!, a missing argument or a bad file index.
+extension Stanza {
+  static func readOrExit(from stream: Stream) -> Stanza {
+    guard let stanza = try? readFrom(stream: stream) else { exitMalformed() }
+    return stanza
+  }
+
+  func requiredArgument() -> String {
+    guard let argument = args.first else { Stanza.exitMalformed() }
+    return argument
+  }
+
+  static func exitMalformed() -> Never {
+    FileHandle.standardError.write(Data("age-plugin-se: malformed plugin input\n".utf8))
+    exit(1)
   }
 }
