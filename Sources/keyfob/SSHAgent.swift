@@ -7,11 +7,18 @@ import Foundation
 final class SSHAgent {
   private enum Message: UInt8 {
     case failure = 5
+    case success = 6
     case requestIdentities = 11
     case identitiesAnswer = 12
     case signRequest = 13
     case signResponse = 14
+    case `extension` = 27
   }
+
+  /// Idle or slow clients each hold a thread; cap them.
+  private static let maxConnections = 64
+  private let connectionLock = NSLock()
+  private var connections = 0
 
   private let socketPath: String
   /// One Touch ID sheet at a time
@@ -23,7 +30,10 @@ final class SSHAgent {
 
   func run() throws -> Never {
     signal(SIGPIPE, SIG_IGN)
-    try Paths.ensureDirectory(URL(fileURLWithPath: socketPath).deletingLastPathComponent())
+    // Not ensureDirectory: the socket may live in a shared directory like /tmp
+    try FileManager.default.createDirectory(
+      at: URL(fileURLWithPath: socketPath).deletingLastPathComponent(),
+      withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     unlink(socketPath)
 
     let server = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -52,27 +62,51 @@ final class SSHAgent {
     log("listening on \(socketPath)")
     while true {
       let client = accept(server, nil, nil)
-      if client < 0 { continue }
+      if client < 0 {
+        // EMFILE and friends: back off instead of spinning
+        usleep(100_000)
+        continue
+      }
+      connectionLock.lock()
+      let accepted = connections < SSHAgent.maxConnections
+      if accepted { connections += 1 }
+      connectionLock.unlock()
+      guard accepted else {
+        close(client)
+        continue
+      }
       Thread.detachNewThread { [self] in
         serve(client)
         close(client)
+        connectionLock.lock()
+        connections -= 1
+        connectionLock.unlock()
       }
     }
   }
 
+  /// One client connection. ssh announces agent forwarding with the
+  /// session-bind@openssh.com extension before forwarded requests.
+  private final class Connection {
+    let peer: Caller
+    var forwarded = false
+    init(peer: Caller) { self.peer = peer }
+  }
+
   private func serve(_ fd: Int32) {
-    let peer = Caller(socket: fd)
+    let connection = Connection(peer: Caller(socket: fd))
     while let request = readMessage(fd) {
-      let response = handle(request, peer: peer)
+      let response = handle(request, connection: connection)
       var framed = SSHWriter()
       framed.string(response)
       guard writeAll(fd, framed.data) else { return }
     }
   }
 
-  private func handle(_ request: Data, peer: Caller) -> Data {
+  private func handle(_ request: Data, connection: Connection) -> Data {
     var reader = SSHReader(request)
     guard let type = try? reader.byte() else { return failure() }
+    let peer = connection.peer
 
     switch Message(rawValue: type) {
     case .requestIdentities:
@@ -88,6 +122,16 @@ final class SSHAgent {
       }
       return writer.data
 
+    case .extension:
+      // string "session-bind@openssh.com", string hostkey, string session id,
+      // string signature, bool is_forwarding
+      guard (try? reader.text()) == "session-bind@openssh.com",
+        (try? reader.string()) != nil, (try? reader.string()) != nil,
+        (try? reader.string()) != nil, let forwarding = try? reader.byte()
+      else { return failure() }
+      if forwarding != 0 { connection.forwarded = true }
+      return Data([Message.success.rawValue])
+
     case .signRequest:
       do {
         let keyBlob = try reader.string()
@@ -98,21 +142,22 @@ final class SSHAgent {
           })
         else { return failure() }
 
-        let action = SignReason.describe(data, caller: peer, key: key)
+        let request = SignRequest(data: data, caller: peer, key: key, forwarded: connection.forwarded)
         signLock.lock()
         defer { signLock.unlock() }
         do {
           let app = peer.displayApp
           let (signature, reused) = try Persona.sign(
-            data, with: key, reason: peer.reason(action, speaker: Persona.fileName(app)), as: app)
-          AuditLog.record(action, caller: peer, outcome: reused ? "reused" : "allowed")
+            data, with: key, reason: peer.reason(request.action, speaker: Persona.fileName(app)),
+            as: app, reuseScope: request.reuseScope)
+          AuditLog.record(request.action, caller: peer, outcome: reused ? "reused" : "allowed")
 
           var writer = SSHWriter()
           writer.byte(Message.signResponse.rawValue)
           writer.string(SSHKey.signature(signature))
           return writer.data
         } catch {
-          AuditLog.record(action, caller: peer, outcome: "denied")
+          AuditLog.record(request.action, caller: peer, outcome: "denied")
           throw error
         }
       } catch {
@@ -176,14 +221,31 @@ extension Caller {
   }
 }
 
-/// Turns the bytes being signed into the action shown on the Touch ID sheet.
-enum SignReason {
-  static func describe(_ data: Data, caller: Caller, key: Key) -> String {
+/// A signature request: the action shown on the Touch ID sheet, and how far
+/// an approval of it may be reused.
+struct SignRequest {
+  let action: String
+  /// Requests sharing a scope reuse one approval of a normal key for a few
+  /// minutes; nil means always ask. A scope is one app process, one key and
+  /// one kind of action (signing in a repository, logging in to a host).
+  let reuseScope: String?
+
+  init(data: Data, caller: Caller, key: Key, forwarded: Bool) {
+    let instance = caller.appInstance.map { "\($0)\u{0}\(key.fingerprint)" }
+
     if data.starts(with: Data("SSHSIG".utf8)) {
       var reader = SSHReader(data.dropFirst(6))
       let namespace = (try? reader.text()) ?? ""
-      guard namespace == "git" else { return Prompt.lines("sign data for \(namespace)", [], key: key.promptLine) }
-      return Prompt.gitSigning(caller, tag: caller.gitSubcommand == "tag", key: key)
+      guard namespace == "git" else {
+        action = Prompt.lines("sign data for \(namespace)", [], key: key.promptLine)
+        reuseScope = nil
+        return
+      }
+      let tag = caller.gitSubcommand == "tag"
+      action = Prompt.gitSigning(caller, tag: tag, key: key)
+      // Tags mark releases: always ask
+      reuseScope = tag ? nil : instance.map { "\($0)\u{0}sign\u{0}\(caller.repositoryPath ?? "")" }
+      return
     }
 
     // SSH_MSG_USERAUTH_REQUEST publickey signature
@@ -191,8 +253,17 @@ enum SignReason {
     if (try? reader.string()) != nil, (try? reader.byte()) == 50,
       let user = try? reader.text()
     {
-      return Prompt.sshLogin(caller, user: user, key: key)
+      action = Prompt.sshLogin(caller, user: user, key: key, forwarded: forwarded)
+      let push = caller.push
+      // Forwarded requests come from another machine, and destructive
+      // pushes deserve their own look: always ask for those
+      let destructive = push.map { $0.force || $0.delete } ?? false
+      let host = caller.sshEndpoint.map { "\(user)@\($0.host):\($0.port)" }
+      reuseScope =
+        forwarded || destructive ? nil : instance.flatMap { i in host.map { "\(i)\u{0}login\u{0}\($0)" } }
+      return
     }
-    return Prompt.lines("sign SSH data", [("🔧", caller.initiatorLabel)], key: key.promptLine)
+    action = Prompt.lines("sign SSH data", [("🔧", caller.initiatorLabel)], key: key.promptLine)
+    reuseScope = nil
   }
 }

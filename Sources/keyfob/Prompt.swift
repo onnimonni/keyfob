@@ -1,8 +1,8 @@
 import Foundation
 
 /// The text after "<App> is trying to" on the Touch ID sheet: a short title,
-/// then one emoji-marked fact per line, ending with the key that will be
-/// used, so the period macOS appends closes a sentence.
+/// then one emoji-marked fact per line. Every value is caller-controlled and
+/// cleaned to a single line, so callers cannot add lines of their own.
 enum Prompt {
   static func gitSigning(_ caller: Caller, tag: Bool, key: Key) -> String {
     let repository = caller.repositoryPath.flatMap(GitRepository.init(workTree:))
@@ -18,30 +18,38 @@ enum Prompt {
 
   /// Login over SSH; for git, phrased as the git operation with the server
   /// (`github.com`, `deploy@host:2222`) and repository path on their own lines.
-  static func sshLogin(_ caller: Caller, user: String, key: Key) -> String {
+  /// Requests forwarded from another machine (`ssh -A`) are called out.
+  static func sshLogin(_ caller: Caller, user: String, key: Key, forwarded: Bool) -> String {
+    let forwarding = ("🔀", forwarded ? "forwarded from a remote host" : nil)
     // `git@` is implied for git hosting
     let login = user == "git" ? "" : "\(user)@"
     let host = caller.sshEndpoint.map {
       $0.port == "22" ? "\(login)\($0.host)" : "\(login)\($0.host):\($0.port)"
     }
-    guard let path = caller.sshRemoteRepository else {
+    guard !forwarded, let path = caller.sshRemoteRepository else {
       return lines(
-        "log in over SSH", [("🖥️", host), ("🔧", caller.initiatorLabel)], key: key.promptLine)
+        "log in over SSH",
+        [forwarding, ("🖥️", forwarded ? "as \(user)" : host), ("🔧", caller.initiatorLabel)],
+        key: key.promptLine)
     }
-    let operation = gitTitle(caller) ?? "use Git"
     return lines(
-      operation,
+      gitTitle(caller) ?? "use Git",
       [("🌐", host), ("📦", repositoryPath(path)), ("📁", caller.repository)]
         + pushFacts(caller),
       key: key.promptLine)
   }
 
+  /// `url` is the credential git asked for: its host is what the token is
+  /// released to, so it is shown even if git's remote claims something else.
   static func gitCredentials(_ caller: Caller, url: String) -> String {
-    let title = gitTitle(caller) ?? "use Git credentials"
-    let remote = URLComponents(string: caller.httpRemote ?? url)
+    let requested = URLComponents(string: url)
+    let remote = caller.httpRemote.flatMap(URLComponents.init(string:))
+    let path =
+      requested.map(\.path).flatMap { $0.isEmpty ? nil : $0 }
+      ?? (remote?.host == requested?.host ? remote?.path : nil)
     return lines(
-      title,
-      [("🌐", remote?.host), ("📦", remote.map(\.path).flatMap { $0.isEmpty ? nil : repositoryPath($0) })]
+      gitTitle(caller) ?? "use Git credentials",
+      [("🌐", requested?.host), ("📦", path.flatMap { $0.isEmpty ? nil : repositoryPath($0) })]
         + [("📁", caller.repository)] + pushFacts(caller),
       key: nil)
   }
@@ -68,20 +76,25 @@ enum Prompt {
       key: key.map(\.promptLine) ?? "🔑 using age-plugin-se key")
   }
 
-  /// `git push`, `git fetch`, …; a forced push is called out in the title.
+  /// `git push`, `git fetch`, …; a push that may rewrite or delete history is
+  /// called out in the title.
   private static func gitTitle(_ caller: Caller) -> String? {
-    caller.push?.force == true ? "FORCE push" : caller.gitSubcommand.map { "git \($0)" }
+    if let push = caller.push, push.force || push.delete { return "FORCE push" }
+    return caller.gitSubcommand.map { "git \($0)" }
   }
 
-  /// Force warning and branch of a `git push`; nothing for other commands.
+  /// Branch and destructive-push warning of a `git push`; nothing otherwise.
   private static func pushFacts(_ caller: Caller) -> [(String, String?)] {
-    [("🌿", caller.push?.branches), ("‼️", caller.push?.force == true ? "may rewrite history" : nil)]
+    let push = caller.push
+    let warning =
+      push?.delete == true ? "may delete branches" : push?.force == true ? "may rewrite history" : nil
+    return [("🌿", push?.branches), ("‼️", warning)]
   }
 
   /// `title:`, a 🚨 dangerous key right below it so it cannot be missed, the
   /// facts, any other key line, then the push branch and force warning last.
   static func lines(_ title: String, _ facts: [(String, String?)], key: String?) -> String {
-    let present = facts.compactMap { icon, value in value.map { "\(icon) \($0)" } }
+    let present = facts.compactMap { icon, value in value.map { "\(icon) \(Caller.clean($0))" } }
     let keyLines = [key].compactMap { $0 }
     let isTrailing = { (line: String) in line.hasPrefix("🌿") || line.hasPrefix("‼️") }
     let ordered =
@@ -89,6 +102,7 @@ enum Prompt {
       + present.filter { !isTrailing($0) }
       + keyLines.filter { !$0.hasPrefix("🚨") }
       + present.filter(isTrailing)
-    return ordered.isEmpty ? title : ([title + ":"] + ordered).joined(separator: "\n")
+    let heading = Caller.clean(title)
+    return ordered.isEmpty ? heading : ([heading + ":"] + ordered).joined(separator: "\n")
   }
 }

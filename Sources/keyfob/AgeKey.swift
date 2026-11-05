@@ -2,8 +2,8 @@ import CryptoKit
 import LocalAuthentication
 
 /// Wraps the age plugin's Secure Enclave key so the Touch ID sheet names
-/// the keyfob key in use. The reason is set right before the key is used,
-/// since one plugin run may load several identities.
+/// the keyfob key in use, and the audit log records the outcome. Each key
+/// has its own context, so one approval never unlocks another identity.
 struct NamedAgeKey: SecureEnclaveP256PrivateKey {
   let key: SecureEnclave.P256.KeyAgreement.PrivateKey
   let context: LAContext
@@ -14,7 +14,16 @@ struct NamedAgeKey: SecureEnclaveP256PrivateKey {
   func sharedSecretFromKeyAgreement(with publicKeyShare: P256.KeyAgreement.PublicKey) throws
     -> SharedSecret
   {
-    context.localizedReason = AgePrompt.reason(p256Data: key.dataRepresentation)
-    return try key.sharedSecretFromKeyAgreement(with: publicKeyShare)
+    let named = Key.age(matching: key.dataRepresentation)
+    let action = Prompt.ageDecrypt(AgePrompt.caller, key: named)
+    context.localizedReason = AgePrompt.caller.reason(action)
+    do {
+      let secret = try key.sharedSecretFromKeyAgreement(with: publicKeyShare)
+      AuditLog.record(action, caller: AgePrompt.caller, outcome: "allowed")
+      return secret
+    } catch {
+      AuditLog.record(action, caller: AgePrompt.caller, outcome: "denied")
+      throw error
+    }
   }
 }

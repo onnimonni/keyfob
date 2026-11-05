@@ -44,6 +44,9 @@ echo "git credentials"
 printf 'protocol=https\nhost=example.com\nusername=bob\npassword=tok\n' | git credential-keyfob store
 [ "$(printf 'protocol=https\nhost=example.com\n' | git credential-keyfob get)" = "$(printf 'username=bob\npassword=tok')" ]
 [ -z "$(printf 'protocol=https\nhost=example.com\nusername=eve\n' | git credential-keyfob get)" ]
+# erasing eve's credential leaves bob's alone
+printf 'protocol=https\nhost=example.com\nusername=eve\n' | git credential-keyfob erase
+[ -n "$(printf 'protocol=https\nhost=example.com\n' | git credential-keyfob get)" ]
 printf 'protocol=https\nhost=example.com\n' | git credential-keyfob erase
 [ -z "$(printf 'protocol=https\nhost=example.com\n' | git credential-keyfob get)" ]
 

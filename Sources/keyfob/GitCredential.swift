@@ -4,8 +4,12 @@ import Foundation
 /// git credential helper (gitcredentials(7)). Tokens are encrypted to a
 /// Secure Enclave key: storing needs only its public key, reading needs Touch ID.
 enum GitCredential {
-  private static let magic = Data("KFC1".utf8)
+  /// v2 keeps the username readable (authenticated, not secret), so lookups
+  /// and erases for another user need no Touch ID. v1 files still open.
+  private static let magic = Data("KFC2".utf8)
+  private static let legacyMagic = Data("KFC1".utf8)
   private static let info = Data("keyfob git-credential v1".utf8)
+  private static let shareLength = 65
   /// Fields worth keeping between `store` and `get`
   private static let storedFields = [
     "username", "password", "password_expiry_utc", "oauth_refresh_token",
@@ -17,15 +21,22 @@ enum GitCredential {
     var id = "\(proto)://\(host)"
     if let path = request["path"], !path.isEmpty { id += "/\(path)" }
     let file = Paths.credentials.appendingPathComponent(fileName(id))
+    let sealed = try? Data(contentsOf: file)
+    // A credential stored for someone else is left alone
+    if let wanted = request["username"], let stored = sealed.flatMap(storedUsername),
+      wanted != stored
+    {
+      return
+    }
 
     switch operation {
     case "get":
-      guard Paths.exists(file) else { return }
+      guard let sealed else { return }
       let caller = Caller.parent
       let action = Prompt.gitCredentials(caller, url: id)
       let plaintext: Data
       do {
-        plaintext = try open(Data(contentsOf: file), id: id, reason: caller.reason(action))
+        plaintext = try open(sealed, id: id, reason: caller.reason(action))
         AuditLog.record(action, caller: caller, outcome: "allowed")
       } catch {
         AuditLog.record(action, caller: caller, outcome: "denied")
@@ -42,8 +53,9 @@ enum GitCredential {
 
     case "store":
       guard request["password"] != nil else { return }
-      let plaintext = format(request.filter { storedFields.contains($0.key) })
-      try Paths.writePrivate(try seal(Data(plaintext.utf8), id: id), to: file)
+      let fields = request.filter { storedFields.contains($0.key) }
+      try Paths.writePrivate(
+        try seal(Data(format(fields).utf8), id: id, username: fields["username"] ?? ""), to: file)
 
     case "erase":
       try? FileManager.default.removeItem(at: file)
@@ -54,7 +66,9 @@ enum GitCredential {
     }
   }
 
-  private static func seal(_ plaintext: Data, id: String) throws -> Data {
+  /// `KFC2`, username length (UInt16) and bytes, ephemeral P-256 share,
+  /// ChaChaPoly box authenticating the id and the username.
+  private static func seal(_ plaintext: Data, id: String, username: String) throws -> Data {
     guard Paths.exists(Paths.credentialsKey) else {
       throw KeyfobError("no credentials key, run `keyfob init` first")
     }
@@ -67,16 +81,26 @@ enum GitCredential {
         using: SHA256.self,
         salt: ephemeral.publicKey.x963Representation + recipient.x963Representation,
         sharedInfo: info, outputByteCount: 32)
-    let box = try ChaChaPoly.seal(plaintext, using: key, authenticating: Data(id.utf8))
-    return magic + ephemeral.publicKey.x963Representation + box.combined
+    let user = Data(username.utf8.prefix(Int(UInt16.max)))
+    let box = try ChaChaPoly.seal(
+      plaintext, using: key, authenticating: authenticated(id: id, username: user))
+    return magic + Data([UInt8(user.count >> 8), UInt8(user.count & 0xFF)]) + user
+      + ephemeral.publicKey.x963Representation + box.combined
   }
 
   private static func open(_ sealed: Data, id: String, reason: String) throws -> Data {
-    let shareLength = 65
-    guard sealed.starts(with: magic), sealed.count > magic.count + shareLength else {
+    let body: Data
+    let aad: Data
+    if let user = storedUsernameData(sealed) {
+      body = Data(sealed.dropFirst(magic.count + 2 + user.count))
+      aad = authenticated(id: id, username: user)
+    } else if sealed.starts(with: legacyMagic) {
+      body = Data(sealed.dropFirst(legacyMagic.count))
+      aad = Data(id.utf8)
+    } else {
       throw KeyfobError("unrecognized credential file for \(id)")
     }
-    let body = sealed.dropFirst(magic.count)
+    guard body.count > shareLength else { throw KeyfobError("truncated credential file for \(id)") }
     let ephemeral = try P256.KeyAgreement.PublicKey(x963Representation: body.prefix(shareLength))
     let privateKey = try SecureEnclaveKeys.loadAgreementKey(reason: reason)
     let key = try privateKey.sharedSecretFromKeyAgreement(with: ephemeral)
@@ -85,7 +109,26 @@ enum GitCredential {
         salt: ephemeral.x963Representation + privateKey.publicKey.x963Representation,
         sharedInfo: info, outputByteCount: 32)
     let box = try ChaChaPoly.SealedBox(combined: body.dropFirst(shareLength))
-    return try ChaChaPoly.open(box, using: key, authenticating: Data(id.utf8))
+    return try ChaChaPoly.open(box, using: key, authenticating: aad)
+  }
+
+  private static func authenticated(id: String, username: Data) -> Data {
+    Data(id.utf8) + Data([0]) + username
+  }
+
+  /// Username bytes of a v2 file; nil for v1 or broken files.
+  private static func storedUsernameData(_ sealed: Data) -> Data? {
+    guard sealed.starts(with: magic), sealed.count >= magic.count + 2 else { return nil }
+    let bytes = [UInt8](sealed)
+    let length = Int(bytes[magic.count]) << 8 | Int(bytes[magic.count + 1])
+    let start = magic.count + 2
+    guard bytes.count >= start + length else { return nil }
+    return Data(bytes[start..<start + length])
+  }
+
+  /// Username of a v2 file without decrypting it; nil for v1 files.
+  private static func storedUsername(_ sealed: Data) -> String? {
+    storedUsernameData(sealed).map { String(decoding: $0, as: UTF8.self) }
   }
 
   private static func parse(_ data: Data) -> [String: String] {

@@ -27,7 +27,7 @@ credentials key. Add more with `keyfob new ssh|age NAME [--dangerous]`:
 | | normal | `--dangerous` |
 |---|---|---|
 | Unlock | Touch ID or password | Touch ID only |
-| SSH agent | one approval covers 5 minutes per app and key | every use |
+| SSH agent | one approval covers 5 minutes of the same request kind (signing in one repo, logging in to one host) from the same app process; never for tags, FORCE pushes or forwarded requests | every use |
 | Fingerprints change | key keeps working | key is destroyed |
 | Touch ID sheet | names the key unless it is `default` | 🚨 names the key, right under the title |
 

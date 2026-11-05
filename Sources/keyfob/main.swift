@@ -20,9 +20,10 @@ let usage = """
     keyfob install-launch-agent          write a LaunchAgent that runs the SSH agent
     keyfob git-credential get|store|erase
 
-  Keys accept Touch ID or your password, and the SSH agent lets one approval
-  cover 5 minutes per app and key. --dangerous keys need Touch ID on every use
-  and stop working when fingerprints change.
+  Keys accept Touch ID or your password. In the SSH agent one approval covers
+  5 minutes of the same kind of request (signing in one repository, logging in
+  to one host) from the same app process. --dangerous keys need Touch ID on
+  every use and stop working when fingerprints change.
 
   Also runs as `git-credential-keyfob` (git credential helper) and as
   `age-plugin-se` (age plugin, compatible with age-plugin-se identities).
@@ -31,7 +32,11 @@ let usage = """
 func run(_ arguments: [String]) throws {
   let invokedAs = URL(fileURLWithPath: arguments[0]).lastPathComponent
   let args = Array(arguments.dropFirst())
+  // Keys without Touch ID are for the test suite only, which sets KEYFOB_HOME
   let insecure = args.contains("--insecure-no-touch-id")
+  if insecure, ProcessInfo.processInfo.environment["KEYFOB_HOME"] == nil {
+    throw KeyfobError("--insecure-no-touch-id only works with KEYFOB_HOME set (tests)")
+  }
 
   switch invokedAs {
   case "git-credential-keyfob":
@@ -87,8 +92,8 @@ func run(_ arguments: [String]) throws {
     try GitCredential.run(args.dropFirst().first ?? "")
   case "__sign" where args.count == 3:
     try Persona.signOnce(keyName: args[1], reason: args[2])
-  case "__signer" where args.count == 3:
-    try Persona.serveSignatures(keyName: args[1], reuseSeconds: TimeInterval(args[2]) ?? 0)
+  case "__signer" where args.count == 2:
+    try Persona.serveSignatures(keyName: args[1])
   case "version", "--version":
     print(version)
   case nil, "help", "--help", "-h":
@@ -103,11 +108,6 @@ enum AgePrompt {
   static let caller = Caller.parent
 
   static var action: String { Prompt.ageDecrypt(caller, key: nil) }
-
-  /// Named after the keyfob age key that holds `p256Data`.
-  static func reason(p256Data: Data) -> String {
-    caller.reason(Prompt.ageDecrypt(caller, key: Key.age(matching: p256Data)))
-  }
 }
 
 func runAgePlugin(_ args: [String]) throws {
@@ -116,8 +116,6 @@ func runAgePlugin(_ args: [String]) throws {
   case "--age-plugin=recipient-v1":
     plugin.runRecipientV1()
   case "--age-plugin=identity-v1":
-    // The plugin protocol hides the outcome from us, so log the request
-    AuditLog.record(AgePrompt.action, caller: AgePrompt.caller, outcome: "requested")
     plugin.runIdentityV1()
   default:
     throw KeyfobError("this is keyfob's age plugin; create keys with `keyfob new age NAME`")

@@ -26,15 +26,28 @@ enum Paths {
   static var sshConfig: URL { home.appendingPathComponent("ssh_config") }
   static var allowedSigners: URL { home.appendingPathComponent("allowed_signers") }
 
+  /// Creates `url` if needed and makes it private, also when something else
+  /// (e.g. home-manager) created it first.
   static func ensureDirectory(_ url: URL) throws {
     try FileManager.default.createDirectory(
       at: url, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
   }
 
+  /// Atomic write of a 0600 file that is never readable by others, not even
+  /// briefly: the temporary file is created with those permissions.
   static func writePrivate(_ data: Data, to url: URL) throws {
     try ensureDirectory(url.deletingLastPathComponent())
-    try data.write(to: url, options: [.atomic])
-    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    let temporary = url.path + ".\(getpid()).tmp"
+    unlink(temporary)
+    let fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+    guard fd >= 0 else { throw KeyfobError("cannot write \(url.path)") }
+    let written = data.withUnsafeBytes { write(fd, $0.baseAddress, data.count) }
+    close(fd)
+    guard written == data.count, rename(temporary, url.path) == 0 else {
+      unlink(temporary)
+      throw KeyfobError("cannot write \(url.path)")
+    }
   }
 
   static func exists(_ url: URL) -> Bool {
@@ -126,7 +139,15 @@ struct Key {
     guard Paths.exists(probe.handle) else { return nil }
     let metadata = (try? Data(contentsOf: probe.metadataFile))
       .flatMap { try? JSONDecoder().decode(Metadata.self, from: $0) }
-    return Key(kind: kind, name: name, protection: metadata?.protection ?? .normal)
+    // Fail closed: a key whose metadata is missing or broken is treated as dangerous
+    return Key(kind: kind, name: name, protection: metadata?.protection ?? .dangerous)
+  }
+
+  /// Identifies the key material, so a deleted and recreated key of the same
+  /// name never shares an approval with the old one.
+  var fingerprint: String {
+    let data = (try? Data(contentsOf: handle)) ?? Data()
+    return SHA256.hash(data: data).prefix(8).map { String(format: "%02x", $0) }.joined()
   }
 
   static func create(_ kind: Kind, _ name: String, protection: Protection) throws -> Key {

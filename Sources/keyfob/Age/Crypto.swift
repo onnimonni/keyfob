@@ -88,11 +88,13 @@ protocol SecureEnclaveMLKEM768PrivateKey {
     func newSecureEnclaveP256PrivateKey(dataRepresentation: Data) throws
       -> SecureEnclaveP256PrivateKey
     {
-      // keyfob: name the key on the Touch ID sheet
+      // keyfob: name the key on the Touch ID sheet, with a context per key so
+      // approving one identity never unlocks another
+      let keyContext = SecureEnclaveKeys.context(reason: "")
       return NamedAgeKey(
         key: try SecureEnclave.P256.KeyAgreement.PrivateKey(
-          dataRepresentation: dataRepresentation, authenticationContext: context),
-        context: context)
+          dataRepresentation: dataRepresentation, authenticationContext: keyContext),
+        context: keyContext)
     }
 
     func newSecureEnclaveP256PrivateKey(accessControl: SecAccessControl) throws

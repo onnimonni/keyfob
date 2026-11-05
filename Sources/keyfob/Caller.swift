@@ -10,6 +10,9 @@ struct Caller {
   struct Process {
     let pid: pid_t
     let parent: pid_t
+    /// Start time in microseconds: with the pid, identifies this process
+    /// instance even after the pid is reused.
+    let started: Int64
     /// Executable path from the kernel, not the caller-controlled argv[0]
     let path: String
     let arguments: [String]
@@ -33,7 +36,10 @@ struct Caller {
     }
 
     var gitSubcommand: String? {
-      name == "git" ? firstOperand(optionsWithValues: ["-c", "-C"]) : nil
+      guard name == "git" else { return nil }
+      return firstOperand(optionsWithValues: [
+        "-c", "-C", "--git-dir", "--work-tree", "--namespace", "--config-env", "--exec-path",
+      ])
     }
 
     var workingDirectory: String? {
@@ -67,18 +73,16 @@ struct Caller {
   /// Text for the Touch ID sheet. macOS starts it with the executable's name
   /// (`speaker`). When that is already the app (see Persona) the action follows
   /// directly, else the app is named: "keyfob is trying to let iTerm sign …".
+  /// Line breaks in `action` are Prompt's; the values in it are already clean.
   func reason(_ action: String, speaker: String = Persona.currentName) -> String {
     let named = app.map { Persona.fileName($0) == speaker ? action : "let \($0) \(action)" }
-    // Line breaks in `action` are deliberate (see Prompt); clean each line
-    var text = (named ?? action)
-      .split(separator: "\n", omittingEmptySubsequences: false)
-      .map { Caller.clean(String($0), limit: 200) }.joined(separator: "\n")
+    var text = named ?? action
     // macOS appends a period; a lone "." on its own line looks broken
     while text.hasSuffix("\n") { text.removeLast() }
     return text
   }
 
-  /// `for git push in Claude Code`
+  /// `for git push in claude`
   var origin: String? {
     let command = initiator.map(Caller.label)
     switch (command, app) {
@@ -105,11 +109,22 @@ struct Caller {
     return nil
   }
 
-  /// Where it ran: a coding agent if one is in the chain, else the app bundle
-  /// (iTerm, Visual Studio Code, …) the chain descends from.
+  /// The process the app name comes from: a coding agent, else the nearest
+  /// process inside an app bundle.
+  private var appProcess: Process? {
+    chain.first { Caller.agentName($0) != nil } ?? chain.first { Caller.bundleName($0) != nil }
+  }
+
+  /// Where it ran: `claude`, `codex`, … or the app bundle (iTerm, Visual
+  /// Studio Code, …) the chain descends from.
   var app: String? {
-    chain.lazy.compactMap(Caller.agentName).first
-      ?? chain.lazy.compactMap(Caller.bundleName).first
+    appProcess.flatMap { Caller.agentName($0) ?? Caller.bundleName($0) }
+  }
+
+  /// That exact app process (pid + start time). Approvals are reused only
+  /// within it: another program merely named `claude` does not share them.
+  var appInstance: String? {
+    appProcess.map { "\($0.pid)@\($0.started)" }
   }
 
   /// Name the Touch ID sheet is titled with: the app, or `unknown` so an
@@ -158,61 +173,99 @@ struct Caller {
     }
   }
 
-  /// What `git push` updates: the destinations of its refspecs
-  /// (`git push origin HEAD:main` → `main`), else the current branch, and
-  /// whether it is forced (`--force`, `--force-with-lease`, `+refspec`).
-  var push: (branches: String?, force: Bool)? {
-    guard let push = chain.first(where: { $0.gitSubcommand == "push" }) else { return nil }
-    var arguments = push.arguments.dropFirst()
-    arguments = arguments.drop { $0 != "push" }.dropFirst()  // skip `git -C dir -c x=y`
-    let valueOptions: Set<String> = ["--repo", "-o", "--push-option", "--receive-pack", "--exec"]
-    var operands: [String] = []
+  struct Push {
+    /// Branches it updates, `main, dev`
+    var branches: String?
+    /// May rewrite history: `--force`, `-f` (also clustered, `-fu`),
+    /// `--force-with-lease`, `--mirror`, `+refspec`
     var force = false
+    /// Deletes remote branches: `--delete`, `-d`, `:branch`, `--mirror`
+    var delete = false
+  }
+
+  /// What `git push` updates: the destinations of its refspecs
+  /// (`git push origin HEAD:main` → `main`), else the current branch.
+  var push: Push? {
+    guard let process = chain.first(where: { $0.gitSubcommand == "push" }) else { return nil }
+    // Skip `git -C dir -c x=y` up to the subcommand
+    let arguments = process.arguments.dropFirst().drop { $0 != "push" }.dropFirst()
+    let valueOptions: Set<String> = ["--repo", "-o", "--push-option", "--receive-pack", "--exec"]
+    var push = Push()
+    var operands: [String] = []
+    var remoteGiven = false
     var skipNext = false
+    var onlyOperands = false
     for argument in arguments {
       if skipNext {
         skipNext = false
-      } else if valueOptions.contains(argument) {
-        skipNext = true
-      } else if argument.hasPrefix("-") {
-        if ["-f", "--force"].contains(argument) || argument.hasPrefix("--force-with-lease") {
-          force = true
-        }
-        if ["--all", "--mirror", "--tags"].contains(argument) { operands.append(argument) }
-      } else {
+      } else if onlyOperands || !argument.hasPrefix("-") || argument == "-" {
         operands.append(argument)
+      } else if argument == "--" {
+        onlyOperands = true
+      } else if argument.hasPrefix("--") {
+        let option = String(argument.prefix { $0 != "=" })
+        if option == "--repo" { remoteGiven = true }
+        if valueOptions.contains(argument) { skipNext = true }
+        if option == "--force" || option == "--force-with-lease" { push.force = true }
+        if option == "--delete" { push.delete = true }
+        if option == "--mirror" {
+          push.force = true
+          push.delete = true
+        }
+        if ["--all", "--mirror", "--tags", "--branches"].contains(option) {
+          push.branches = String(option.dropFirst(2))
+        }
+      } else {
+        // Clustered short flags: `-fu`; `-o` takes a value
+        if argument.contains("f") { push.force = true }
+        if argument.contains("d") { push.delete = true }
+        if argument.hasSuffix("o") { skipNext = true }
       }
     }
-    // The first operand is the remote, unless only flags like --all were given
-    let refspecs = operands.first?.hasPrefix("--") == true ? operands : Array(operands.dropFirst())
-    var branches = refspecs.map { refspec -> String in
-      if refspec.hasPrefix("+") { force = true }
+    let refspecs = remoteGiven ? operands : Array(operands.dropFirst())
+    let destinations = refspecs.map { refspec -> String in
+      if refspec.hasPrefix("+") { push.force = true }
+      if refspec.hasPrefix(":") { push.delete = true }
       let destination = refspec.split(separator: ":", omittingEmptySubsequences: false).last
         .map(String.init) ?? refspec
       return destination.replacingOccurrences(of: "refs/heads/", with: "")
         .trimmingCharacters(in: CharacterSet(charactersIn: "+"))
-    }.joined(separator: ", ")
-    if branches.isEmpty,
-      let current = push.workingDirectory.flatMap(GitRepository.init(workTree:))?.branch
-    {
-      branches = current
     }
-    return (branches.isEmpty ? nil : branches, force)
+    if !destinations.isEmpty {
+      push.branches = destinations.joined(separator: ", ")
+    } else if push.branches == nil {
+      push.branches = process.workingDirectory.flatMap(GitRepository.init(workTree:))?.branch
+    }
+    return push
   }
 
-  /// Host and port from `ssh -o … -p 2222 git@github.com git-upload-pack '…'`.
+  /// Host and port from `ssh -o … -p 2222 git@github.com git-upload-pack '…'`;
+  /// also `-p2222`, `-vp 2222` and `ssh://host:port`.
   var sshEndpoint: (host: String, port: String)? {
-    let options: Set<String> = [
-      "-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O",
-      "-o", "-P", "-p", "-Q", "-R", "-S", "-W", "-w",
-    ]
-    guard let ssh = chain.first(where: { $0.name == "ssh" }),
-      var host = ssh.firstOperand(optionsWithValues: options)
-    else { return nil }
+    let valueLetters = Set("BbcDEeFIiJLlmOoPpQRSWw")
+    guard let ssh = chain.first(where: { $0.name == "ssh" }) else { return nil }
     var port = "22"
-    if let index = ssh.arguments.firstIndex(of: "-p"), index + 1 < ssh.arguments.count {
-      port = ssh.arguments[index + 1]
+    var destination: String?
+    var rest = ssh.arguments.dropFirst()[...]
+    while let argument = rest.popFirst() {
+      if argument == "--" {
+        destination = rest.first
+        break
+      }
+      guard argument.hasPrefix("-"), argument.count > 1 else {
+        destination = argument
+        break
+      }
+      // Flags cluster (`-vp 2222`); the first letter taking a value takes the
+      // rest of the word (`-p2222`) or the next argument
+      for (offset, letter) in argument.dropFirst().enumerated() where valueLetters.contains(letter) {
+        let attached = String(argument.dropFirst(offset + 2))
+        let value = attached.isEmpty ? rest.popFirst() ?? "" : attached
+        if letter == "p" { port = value }
+        break
+      }
     }
+    guard var host = destination else { return nil }
     if host.hasPrefix("ssh://") {
       host = String(host.dropFirst(6).prefix { $0 != "/" })
       if let colon = host.lastIndex(of: ":") {
@@ -243,14 +296,33 @@ struct Caller {
     return String(command[command.index(after: start)...].prefix { $0 != "'" })
   }
 
+  /// First line of the commit or tag being signed. git hands ssh-keygen the
+  /// object in a temp file (its last argument): headers, blank line, message.
+  var signedSubject: String? {
+    guard let file = chain.first(where: { $0.name == "ssh-keygen" })?.arguments.last else {
+      return nil
+    }
+    // Only a regular file: a FIFO would block the agent thread forever
+    var status = stat()
+    guard stat(file, &status) == 0, status.st_mode & S_IFMT == S_IFREG,
+      let handle = FileHandle(forReadingAtPath: file),
+      let data = try? handle.read(upToCount: 64 * 1024)
+    else { return nil }
+    let text = String(decoding: data, as: UTF8.self)
+    guard let body = text.range(of: "\n\n") else { return nil }
+    var subject = String(text[body.upperBound...].prefix { $0 != "\n" })
+    while subject.hasSuffix(".") { subject.removeLast() }
+    if subject.count > 50 { subject = subject.prefix(49) + "…" }
+    return subject.isEmpty ? nil : subject
+  }
+
   // MARK: Audit log
 
-  /// Every process with pid and full command line.
+  /// Every process: pid, kernel executable path, then its arguments.
   var detail: String {
     chain.map { process in
-      let command = process.arguments.isEmpty
-        ? process.path : process.arguments.joined(separator: " ")
-      return "\(process.pid):\(Caller.clean(command, limit: 200))"
+      let command = ([process.path] + process.arguments.dropFirst()).joined(separator: " ")
+      return "\(process.pid):\(Caller.clean(command, limit: 300))"
     }.joined(separator: " < ")
   }
 
@@ -289,10 +361,11 @@ struct Caller {
       || process.gitSubcommand?.hasPrefix("credential") == true
   }
 
-  /// One line, no control characters, bounded length.
-  static func clean(_ text: String, limit: Int = 60) -> String {
-    let line = String(
-      text.unicodeScalars.map { CharacterSet.controlCharacters.contains($0) ? " " : Character($0) })
+  /// One line of caller-controlled text: line breaks, control and format
+  /// characters (bidi overrides, U+2028, …) become spaces; length is bounded.
+  static func clean(_ text: String, limit: Int = 200) -> String {
+    let unsafe = CharacterSet.controlCharacters.union(.newlines).union(.illegalCharacters)
+    let line = String(text.unicodeScalars.map { unsafe.contains($0) ? " " : Character($0) })
     return line.count > limit ? String(line.prefix(limit - 1)) + "…" : line
   }
 
@@ -310,8 +383,11 @@ struct Caller {
       : withUnsafeBytes(of: info.kp_proc.p_comm) {
         String(decoding: $0.prefix(while: { $0 != 0 }), as: UTF8.self)
       }
+    let start = info.kp_proc.p_un.__p_starttime
     return Process(
-      pid: pid, parent: info.kp_eproc.e_ppid, path: path, arguments: arguments(pid))
+      pid: pid, parent: info.kp_eproc.e_ppid,
+      started: Int64(start.tv_sec) * 1_000_000 + Int64(start.tv_usec),
+      path: path, arguments: arguments(pid))
   }
 
   /// argv via KERN_PROCARGS2: int32 argc, exec path, NUL padding, argv.
@@ -347,11 +423,11 @@ enum AuditLog {
       .appendingPathComponent("Library/Logs/keyfob.log")
   }
 
+  /// One line per request; every field is cleaned so callers cannot forge lines.
   static func record(_ action: String, caller: Caller, outcome: String) {
     let timestamp = ISO8601DateFormatter().string(from: Date())
-    let origin = caller.origin.map { " \($0)" } ?? ""
-    let line =
-      "\(timestamp) \(outcome) \(Caller.clean(action.split(separator: "\n").joined(separator: " "), limit: 200))\(origin) [\(caller.detail)]\n"
+    let origin = caller.origin.map { " " + Caller.clean($0) } ?? ""
+    let line = "\(timestamp) \(outcome) \(Caller.clean(action))\(origin) [\(caller.detail)]\n"
     let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT, 0o600)
     guard fd >= 0 else { return }
     defer { close(fd) }
@@ -362,22 +438,5 @@ enum AuditLog {
     guard Paths.exists(url) else { return }
     let text = try String(contentsOf: url, encoding: .utf8)
     print(text.split(separator: "\n").suffix(lines).joined(separator: "\n"))
-  }
-}
-
-extension Caller {
-  /// First line of the commit or tag being signed. git hands ssh-keygen the
-  /// object in a temp file (its last argument): headers, blank line, message.
-  var signedSubject: String? {
-    guard let file = chain.first(where: { $0.name == "ssh-keygen" })?.arguments.last,
-      let handle = FileHandle(forReadingAtPath: file),
-      let data = try? handle.read(upToCount: 64 * 1024)
-    else { return nil }
-    let text = String(decoding: data, as: UTF8.self)
-    guard let body = text.range(of: "\n\n") else { return nil }
-    var subject = String(text[body.upperBound...].prefix { $0 != "\n" })
-    while subject.hasSuffix(".") { subject.removeLast() }
-    if subject.count > 50 { subject = subject.prefix(49) + "…" }
-    return subject.isEmpty ? nil : subject
   }
 }
