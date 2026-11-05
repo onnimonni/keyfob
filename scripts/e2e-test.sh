@@ -12,19 +12,33 @@ for name in keyfob git-credential-keyfob age-plugin-se; do ln -s "$BIN" "$WORK/b
 export PATH="$WORK/bin:$PATH" KEYFOB_HOME="$WORK/home" SSH_AUTH_SOCK="$SOCK"
 
 keyfob init --insecure-no-touch-id >/dev/null
+keyfob new ssh second --insecure-no-touch-id >/dev/null
+keyfob new age second --insecure-no-touch-id >/dev/null
 
-echo "ssh agent + git signing"
+echo "ssh agent offers every key"
 keyfob ssh-agent --socket "$SOCK" 2>"$WORK/agent.log" &
 AGENT=$!
 for _ in $(seq 50); do [ -S "$SOCK" ] && break; sleep 0.1; done
-[ "$(ssh-add -L | cut -d' ' -f2)" = "$(keyfob ssh-pubkey | cut -d' ' -f2)" ]
+[ "$(ssh-add -L | cut -d' ' -f3)" = "$(printf 'default\nsecond')" ]
+
+echo "git signing with the default key, twice (second reuses the approval)"
 git init -q "$WORK/repo"
 git -C "$WORK/repo" config include.path "$KEYFOB_HOME/gitconfig"
-git -C "$WORK/repo" -c user.name=t -c user.email=t@t commit -q --allow-empty -m test
+for message in one two; do
+  git -C "$WORK/repo" -c user.name=t -c user.email=t@t commit -q --allow-empty -m "$message"
+done
 git -C "$WORK/repo" verify-commit HEAD 2>&1 | grep -q 'Good "git" signature'
+grep -q '^.* reused sign a Git commit' "$KEYFOB_HOME/audit.log"
 
-echo "age"
-[ "$(echo secret | age -r "$(keyfob age-recipient)" | age -d -i "$KEYFOB_HOME/age.txt")" = secret ]
+echo "signing with a named key"
+echo hello >"$WORK/msg"
+ssh-keygen -Y sign -n file -f "$KEYFOB_HOME/ssh/second.pub" "$WORK/msg" 2>/dev/null
+ssh-keygen -Y verify -n file -f "$KEYFOB_HOME/allowed_signers" -I '*' -s "$WORK/msg.sig" <"$WORK/msg" >/dev/null
+
+echo "age with each key"
+for name in default second; do
+  [ "$(echo "secret $name" | age -r "$(keyfob age-recipient "$name")" | age -d -i "$KEYFOB_HOME/age/$name.txt")" = "secret $name" ]
+done
 
 echo "git credentials"
 printf 'protocol=https\nhost=example.com\nusername=bob\npassword=tok\n' | git credential-keyfob store

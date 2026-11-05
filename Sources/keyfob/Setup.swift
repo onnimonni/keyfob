@@ -2,41 +2,26 @@ import CryptoKit
 import Foundation
 import SystemConfiguration
 
-/// `keyfob init`: creates the keys that are missing and writes config
-/// snippets that git and ssh can include.
+/// Key management commands and the config snippets git and ssh include.
 enum Setup {
-  static func initialize(protection: Protection) throws {
+  /// `keyfob init`: the `default` SSH and age keys plus the git credentials
+  /// key, whichever are missing.
+  static func initialize(insecure: Bool) throws {
     try SecureEnclaveKeys.requireSecureEnclave()
     try Paths.ensureDirectory(Paths.home)
 
-    if !Paths.exists(Paths.sshKey) {
-      let key = try SecureEnclaveKeys.createSigningKey(protection: protection)
-      try Paths.writePrivate(key.dataRepresentation, to: Paths.sshKey)
-      print("created SSH key        \(Paths.sshKey.path)")
-    }
-    if !Paths.exists(Paths.ageIdentity) {
-      let plugin = Plugin(crypto: CryptoKitCrypto(), stream: StandardIOStream())
-      let (contents, _) = try plugin.generateKey(
-        accessControl: protection.ageAccessControl, recipientType: .se, now: Date())
-      try Paths.writePrivate(Data(contents.utf8), to: Paths.ageIdentity)
-      print("created age key        \(Paths.ageIdentity.path)")
+    for kind in Key.Kind.allCases where Key.named(kind, Key.defaultName) == nil {
+      let key = try Key.create(kind, Key.defaultName, protection: insecure ? .none : .normal)
+      print("created \(kind.label) key '\(key.name)'")
     }
     if !Paths.exists(Paths.credentialsKey) {
-      let key = try SecureEnclaveKeys.createAgreementKey(protection: protection)
-      try Paths.writePrivate(key.dataRepresentation, to: Paths.credentialsKey)
-      print("created credentials key \(Paths.credentialsKey.path)")
+      try SecureEnclaveKeys.createCredentialsKey(protection: insecure ? .none : .touchID)
+      print("created git credentials key")
     }
-
-    let publicKey = try sshPublicKey()
-    try Paths.writePrivate(Data((publicKey + "\n").utf8), to: Paths.sshPublicKey)
-    let email = ProcessInfo.processInfo.environment["KEYFOB_EMAIL"] ?? "*"
-    try Paths.writePrivate(
-      Data("\(email) \(publicKey)\n".utf8), to: Paths.allowedSigners)
-    try Paths.writePrivate(Data(gitConfig.utf8), to: Paths.gitConfig)
-    try Paths.writePrivate(Data(sshConfig.utf8), to: Paths.sshConfig)
+    try writeConfig()
 
     print("")
-    try status()
+    try list()
     print(
       """
 
@@ -45,34 +30,64 @@ enum Setup {
         echo 'Include \(Paths.sshConfig.path)' >> ~/.ssh/config
         keyfob install-launch-agent
         echo 'eval "$(keyfob env)"' >> ~/.zshrc
-      Then add the SSH key to GitHub as both authentication and signing key.
+      Then add the 'default' SSH key to GitHub as both authentication and signing key.
       """)
   }
 
-  static func status() throws {
-    print("keys in \(Paths.home.path)")
-    print("ssh:    \(Paths.exists(Paths.sshKey) ? try sshPublicKey() : "missing")")
-    print("age:    \(Paths.exists(Paths.ageIdentity) ? try ageRecipient() : "missing")")
-    print("creds:  \(Paths.exists(Paths.credentialsKey) ? "present" : "missing")")
-    print("agent:  \(Paths.agentSocket.path)")
+  /// `keyfob new ssh|age NAME [--dangerous]`
+  static func create(_ kind: Key.Kind, _ name: String, dangerous: Bool, insecure: Bool) throws {
+    let protection: Protection = insecure ? .none : dangerous ? .dangerous : .normal
+    let key = try Key.create(kind, name, protection: protection)
+    try writeConfig()
+    print("created \(key.isDangerous ? "dangerous " : "")\(kind.label) key '\(name)'")
+    print(try key.publicKey())
+    if kind == .ssh {
+      print(
+        """
+
+        Use it for some hosts in ~/.ssh/config:
+          Host prod-*
+            IdentityFile \(key.publicKeyFile.path)
+            IdentitiesOnly yes
+        """)
+    } else {
+      print("\nDecrypt with: age -d -i \(key.handle.path)")
+    }
   }
 
-  static func sshPublicKey() throws -> String {
-    let key = try SecureEnclave.P256.Signing.PrivateKey(
-      dataRepresentation: Data(contentsOf: Paths.sshKey))
-    return SSHKey.authorizedKey(key.publicKey, comment: "keyfob@\(hostName)")
+  static func delete(_ kind: Key.Kind, _ name: String) throws {
+    guard let key = Key.named(kind, name) else {
+      throw KeyfobError("no \(kind.label) key '\(name)'")
+    }
+    try key.delete()
+    try writeConfig()
+    print("deleted \(kind.label) key '\(name)'")
   }
 
-  static func ageRecipient() throws -> String {
-    let plugin = Plugin(crypto: CryptoKitCrypto(), stream: StandardIOStream())
-    return try plugin.generateRecipients(
-      input: String(contentsOf: Paths.ageIdentity, encoding: .utf8), recipientType: .se)
+  static func list() throws {
+    for kind in Key.Kind.allCases {
+      for key in Key.all(kind) {
+        let tag = key.isDangerous ? " 🚨 dangerous" : key.protection == .none ? " (no Touch ID)" : ""
+        print("\(kind.rawValue) \(key.name)\(tag)")
+        print("  \(try key.publicKey())")
+      }
+    }
+    print("git credentials key: \(Paths.exists(Paths.credentialsKey) ? "present" : "missing")")
+    print("agent socket: \(Paths.agentSocket.path)")
+  }
+
+  static func publicKey(_ kind: Key.Kind, _ name: String?) throws -> String {
+    let name = name ?? Key.defaultName
+    guard let key = Key.named(kind, name) else {
+      throw KeyfobError("no \(kind.label) key '\(name)', see `keyfob list`")
+    }
+    return try key.publicKey()
   }
 
   static var environment: String {
     """
     export SSH_AUTH_SOCK=\(shellQuote(Paths.agentSocket.path))
-    export SOPS_AGE_KEY_FILE=\(shellQuote(Paths.ageIdentity.path))
+    export SOPS_AGE_KEY_FILE=\(shellQuote(Key(kind: .age, name: Key.defaultName, protection: .normal).handle.path))
     """
   }
 
@@ -95,37 +110,43 @@ enum Setup {
     print("wrote \(url.path)\nstart it with:\n  launchctl bootstrap gui/$(id -u) \(url.path)")
   }
 
-  private static var gitConfig: String {
-    """
-    # Generated by keyfob (https://github.com/onnimonni/keyfob)
-    [user]
-    \tsigningkey = \(Paths.sshPublicKey.path)
-    [gpg]
-    \tformat = ssh
-    [gpg "ssh"]
-    \tallowedSignersFile = \(Paths.allowedSigners.path)
-    [commit]
-    \tgpgsign = true
-    [tag]
-    \tgpgsign = true
-    [credential]
-    \thelper =
-    \thelper = keyfob
-
-    """
-  }
-
-  private static var sshConfig: String {
-    """
-    # Generated by keyfob (https://github.com/onnimonni/keyfob)
-    Host *
-      IdentityAgent \(Paths.agentSocket.path)
-
-    """
-  }
-
-  private static var hostName: String {
+  static var hostName: String {
     SCDynamicStoreCopyLocalHostName(nil) as String? ?? "mac"
+  }
+
+  /// gitconfig signs with the `default` SSH key; allowed_signers lists all.
+  private static func writeConfig() throws {
+    let email = ProcessInfo.processInfo.environment["KEYFOB_EMAIL"] ?? "*"
+    let signers = try Key.all(.ssh).map { "\(email) \(try $0.publicKey())\n" }.joined()
+    try Paths.writePrivate(Data(signers.utf8), to: Paths.allowedSigners)
+    let signingKey = Key(kind: .ssh, name: Key.defaultName, protection: .normal).publicKeyFile
+    try Paths.writePrivate(
+      Data(
+        """
+        # Generated by keyfob (https://github.com/onnimonni/keyfob)
+        [user]
+        \tsigningkey = \(signingKey.path)
+        [gpg]
+        \tformat = ssh
+        [gpg "ssh"]
+        \tallowedSignersFile = \(Paths.allowedSigners.path)
+        [commit]
+        \tgpgsign = true
+        [tag]
+        \tgpgsign = true
+        [credential]
+        \thelper =
+        \thelper = keyfob
+
+        """.utf8), to: Paths.gitConfig)
+    try Paths.writePrivate(
+      Data(
+        """
+        # Generated by keyfob (https://github.com/onnimonni/keyfob)
+        Host *
+          IdentityAgent \(Paths.agentSocket.path)
+
+        """.utf8), to: Paths.sshConfig)
   }
 
   /// Absolute path of this binary without resolving symlinks, so a stable

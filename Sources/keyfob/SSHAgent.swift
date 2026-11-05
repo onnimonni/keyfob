@@ -78,12 +78,13 @@ final class SSHAgent {
     case .requestIdentities:
       var writer = SSHWriter()
       writer.byte(Message.identitiesAnswer.rawValue)
-      if let key = try? publicKey() {
-        writer.uint32(1)
-        writer.string(SSHKey.blob(key))
-        writer.string("keyfob")
-      } else {
-        writer.uint32(0)
+      let keys = Key.all(.ssh).compactMap { key in
+        (try? key.signingPublicKey()).map { (key.name, SSHKey.blob($0)) }
+      }
+      writer.uint32(UInt32(keys.count))
+      for (name, blob) in keys {
+        writer.string(blob)
+        writer.string(name)
       }
       return writer.data
 
@@ -91,16 +92,20 @@ final class SSHAgent {
       do {
         let keyBlob = try reader.string()
         let data = try reader.string()
-        guard let key = try? publicKey(), keyBlob == SSHKey.blob(key) else { return failure() }
+        guard
+          let key = Key.all(.ssh).first(where: {
+            (try? $0.signingPublicKey()).map(SSHKey.blob) == keyBlob
+          })
+        else { return failure() }
 
-        let action = SignReason.describe(data, caller: peer)
+        let action = SignReason.describe(data, caller: peer, key: key)
         signLock.lock()
         defer { signLock.unlock() }
         do {
           let app = peer.displayApp
-          let signature = try Persona.sign(
-            data, reason: peer.reason(action, speaker: Persona.fileName(app)), as: app)
-          AuditLog.record(action, caller: peer, outcome: "allowed")
+          let (signature, reused) = try Persona.sign(
+            data, with: key, reason: peer.reason(action, speaker: Persona.fileName(app)), as: app)
+          AuditLog.record(action, caller: peer, outcome: reused ? "reused" : "allowed")
 
           var writer = SSHWriter()
           writer.byte(Message.signResponse.rawValue)
@@ -118,13 +123,6 @@ final class SSHAgent {
     default:
       return failure()
     }
-  }
-
-  private func publicKey() throws -> P256.Signing.PublicKey {
-    // Reading the public key never prompts
-    try SecureEnclave.P256.Signing.PrivateKey(
-      dataRepresentation: Data(contentsOf: Paths.sshKey)
-    ).publicKey
   }
 
   private func failure() -> Data { Data([Message.failure.rawValue]) }
@@ -180,12 +178,12 @@ extension Caller {
 
 /// Turns the bytes being signed into the action shown on the Touch ID sheet.
 enum SignReason {
-  static func describe(_ data: Data, caller: Caller) -> String {
+  static func describe(_ data: Data, caller: Caller, key: Key) -> String {
     if data.starts(with: Data("SSHSIG".utf8)) {
       var reader = SSHReader(data.dropFirst(6))
       let namespace = (try? reader.text()) ?? ""
-      guard namespace == "git" else { return "sign data for \(namespace)" }
-      return Prompt.gitSigning(caller, tag: caller.gitSubcommand == "tag")
+      guard namespace == "git" else { return Prompt.lines("sign data for \(namespace)", [], key: key.promptLine) }
+      return Prompt.gitSigning(caller, tag: caller.gitSubcommand == "tag", key: key)
     }
 
     // SSH_MSG_USERAUTH_REQUEST publickey signature
@@ -193,8 +191,8 @@ enum SignReason {
     if (try? reader.string()) != nil, (try? reader.byte()) == 50,
       let user = try? reader.text()
     {
-      return Prompt.sshLogin(caller, user: user)
+      return Prompt.sshLogin(caller, user: user, key: key)
     }
-    return "sign SSH data"
+    return Prompt.lines("sign SSH data", [("🔧", caller.initiatorLabel)], key: key.promptLine)
   }
 }

@@ -39,7 +39,7 @@ in
     sops = lib.mkOption {
       type = lib.types.bool;
       default = false;
-      description = "Point SOPS_AGE_KEY_FILE at keyfob's age identity.";
+      description = "Point SOPS_AGE_KEY_FILE at keyfob's default age key.";
     };
   };
 
@@ -70,7 +70,7 @@ in
       })
 
       (lib.mkIf cfg.sops {
-        home.sessionVariables.SOPS_AGE_KEY_FILE = "${keyfobHome}/age.txt";
+        home.sessionVariables.SOPS_AGE_KEY_FILE = "${keyfobHome}/age/default.txt";
       })
     ]
   );
