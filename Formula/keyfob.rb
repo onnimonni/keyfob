@@ -4,8 +4,8 @@
 class Keyfob < Formula
   desc "Secure Enclave keys for SSH, git and age on macOS, unlocked with Touch ID"
   homepage "https://github.com/onnimonni/keyfob"
-  url "https://github.com/onnimonni/keyfob/archive/refs/tags/v0.3.0.tar.gz"
-  sha256 "65c43857da2acc05e9318f2f1bea3df940a36b7d887aea72300a8e97297527b2"
+  url "https://github.com/onnimonni/keyfob/archive/refs/tags/v0.3.1.tar.gz"
+  sha256 "ad5f1d9aeefc6c4ec80f502278c7c0a15a54665af4c259596131be9a378193f0"
   license "MIT"
   head "https://github.com/onnimonni/keyfob.git", branch: "main"
 
