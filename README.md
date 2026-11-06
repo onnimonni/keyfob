@@ -198,7 +198,8 @@ printf 'protocol=https\nhost=github.com\nusername=you\npassword=TOKEN\n' | git c
 
 ```sh
 swift build -c release
-./scripts/e2e-test.sh   # uses keys without Touch ID, needs a Secure Enclave
+./scripts/e2e-test.sh          # keys without Touch ID; needs a Secure Enclave
+./scripts/forwarding-test.sh   # ssh -A against Linux sshd containers (Apple `container`)
 nix build
 ```
 
