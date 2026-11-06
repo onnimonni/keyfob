@@ -110,6 +110,52 @@ enum Setup {
     print("wrote \(url.path)\nstart it with:\n  launchctl bootstrap gui/$(id -u) \(url.path)")
   }
 
+  /// Puts `Include ~/.config/keyfob/ssh_config` at the top of ~/.ssh/config,
+  /// so keyfob's IdentityAgent wins over later ones (ssh uses the first value
+  /// it sees). Idempotent; keeps a backup; refuses a symlinked (managed) file.
+  static func installSSHConfig() throws {
+    try writeConfig()
+    let home = ProcessInfo.processInfo.environment["HOME"].flatMap { $0.isEmpty ? nil : $0 }
+    let config = URL(fileURLWithPath: home ?? NSHomeDirectory()).appendingPathComponent(".ssh/config")
+    let include = "Include \(Paths.sshConfig.path)"
+    let manager = FileManager.default
+
+    if let destination = try? manager.destinationOfSymbolicLink(atPath: config.path) {
+      throw KeyfobError(
+        """
+        ~/.ssh/config is a symlink (\(destination)), probably managed by nix or a dotfiles tool.
+        Add this line at its top there instead:
+          \(include)
+        or with home-manager: programs.keyfob.enable = true (sets SSH_AUTH_SOCK) and
+          programs.ssh.includes = [ "\(Paths.sshConfig.path)" ];
+        """)
+    }
+    let existing = (try? String(contentsOf: config, encoding: .utf8)) ?? ""
+    if existing.split(whereSeparator: \.isNewline).contains(where: {
+      $0.trimmingCharacters(in: .whitespaces) == include
+    }) {
+      print("~/.ssh/config already includes \(Paths.sshConfig.path)")
+      return
+    }
+    if !existing.isEmpty {
+      let backup = config.path + ".keyfob-backup"
+      try? manager.removeItem(atPath: backup)
+      try manager.copyItem(atPath: config.path, toPath: backup)
+      print("backed up ~/.ssh/config to \(backup)")
+    }
+    try manager.createDirectory(
+      at: config.deletingLastPathComponent(), withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o700])
+    let header = "# Added by keyfob (https://github.com/onnimonni/keyfob)\n\(include)\n\n"
+    try Paths.writePrivate(Data((header + existing).utf8), to: config)
+    print(
+      """
+      added to the top of ~/.ssh/config:
+        \(include)
+      Make sure the agent runs: keyfob install-launch-agent
+      """)
+  }
+
   static var hostName: String {
     SCDynamicStoreCopyLocalHostName(nil) as String? ?? "mac"
   }

@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 
-let version = "0.2.0"
+let version = "0.3.0"
 
 let usage = """
   keyfob \(version): Secure Enclave keys for SSH, git and age, unlocked with Touch ID
@@ -12,18 +12,24 @@ let usage = """
     keyfob new ssh|age NAME [--dangerous] create another key
     keyfob delete ssh|age NAME           delete a key (it is gone for good)
     keyfob list                          show keys and public keys
+    keyfob status                        show approvals the agent still remembers
+    keyfob lock                          forget all approvals now
     keyfob ssh-pubkey [NAME]             print an SSH public key
     keyfob age-recipient [NAME]          print an age recipient (age1se1...)
-    keyfob ssh-agent [--socket PATH]     run the SSH agent in the foreground
+    keyfob ssh-agent [--socket PATH]     run the agent in the foreground
+    keyfob install-ssh-config            use the agent from ~/.ssh/config
+    keyfob install-launch-agent          start the agent at login (LaunchAgent)
     keyfob env                           print SSH_AUTH_SOCK and SOPS_AGE_KEY_FILE exports
     keyfob log                           show recent Touch ID requests and who made them
-    keyfob install-launch-agent          write a LaunchAgent that runs the SSH agent
     keyfob git-credential get|store|erase
 
-  Keys accept Touch ID or your password. In the SSH agent one approval covers
-  5 minutes of the same kind of request (signing in one repository, logging in
-  to one host) from the same app process. --dangerous keys need Touch ID on
-  every use and stop working when fingerprints change.
+  Keys accept Touch ID or your password. The agent remembers an approval for
+  a few minutes, but only for the same kind of request (commits in one repo,
+  logins to one host, credentials for one host, age in one project) from the
+  same app session; FORCE pushes, tags, forwarded requests and unknown apps
+  always ask. Screen lock, sleep and `keyfob lock` forget every approval.
+  --dangerous keys need Touch ID on every use and stop working when
+  fingerprints change.
 
   Also runs as `git-credential-keyfob` (git credential helper) and as
   `age-plugin-se` (age plugin, compatible with age-plugin-se identities).
@@ -40,11 +46,14 @@ func run(_ arguments: [String]) throws {
 
   switch invokedAs {
   case "git-credential-keyfob":
-    if args.first == "get" { Persona.becomeCallerApp() }
+    // With an agent, its child shows the Touch ID sheet; else this process does
+    if args.first == "get", !AgentClient.isAvailable { Persona.becomeCallerApp() }
     try GitCredential.run(args.first ?? "")
     return
   case "age-plugin-se", "age-plugin-keyfob":
-    if args.first == "--age-plugin=identity-v1" { Persona.becomeCallerApp() }
+    if args.first == "--age-plugin=identity-v1", !AgentClient.isAvailable {
+      Persona.becomeCallerApp()
+    }
     try runAgePlugin(args)
     return
   default:
@@ -70,14 +79,26 @@ func run(_ arguments: [String]) throws {
   case "delete":
     let (kind, name) = try keyArguments()
     try Setup.delete(kind, name)
-  case "list", "status":
+  case "list":
     try Setup.list()
+  case "status":
+    guard let active = AgentClient.status() else {
+      throw KeyfobError("the agent is not running (\(AgentClient.socketPath))")
+    }
+    print(active.isEmpty ? "no remembered approvals" : active.joined(separator: "\n"))
+  case "lock":
+    guard AgentClient.lock() else {
+      throw KeyfobError("the agent is not running (\(AgentClient.socketPath))")
+    }
+    print("forgot all approvals")
   case "ssh-agent":
     var socket = Paths.agentSocket.path
     if let index = args.firstIndex(of: "--socket"), index + 1 < args.count {
       socket = args[index + 1]
     }
     try SSHAgent(socketPath: socket).run()
+  case "install-ssh-config":
+    try Setup.installSSHConfig()
   case "ssh-pubkey":
     print(try Setup.publicKey(.ssh, operand))
   case "age-recipient":
@@ -90,10 +111,10 @@ func run(_ arguments: [String]) throws {
     try Setup.installLaunchAgent()
   case "git-credential":
     try GitCredential.run(args.dropFirst().first ?? "")
-  case "__sign" where args.count == 3:
-    try Persona.signOnce(keyName: args[1], reason: args[2])
-  case "__signer" where args.count == 2:
-    try Persona.serveSignatures(keyName: args[1])
+  case "__unlock" where args.count == 4:
+    guard let mode = Persona.Mode(rawValue: args[1]), let protection = Protection(rawValue: args[2])
+    else { throw KeyfobError("bad __unlock arguments") }
+    try Persona.serveUnlocks(mode: mode, protection: protection, seconds: TimeInterval(args[3]) ?? 0)
   case "version", "--version":
     print(version)
   case nil, "help", "--help", "-h":

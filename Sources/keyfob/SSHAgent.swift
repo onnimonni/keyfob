@@ -1,11 +1,14 @@
+import AppKit
 import CryptoKit
 import Darwin
 import Foundation
 
-/// Minimal ssh-agent (draft-miller-ssh-agent): lists the keyfob key and signs
-/// with it. Every signature needs Touch ID. Everything else is refused.
+/// ssh-agent (draft-miller-ssh-agent) serving the keyfob SSH keys, and the
+/// broker for every other Secure Enclave key use: git credentials and age
+/// decryption come in as keyfob extensions, so all of them share one reuse
+/// policy (see Reuse) and one `keyfob lock`.
 final class SSHAgent {
-  private enum Message: UInt8 {
+  enum Message: UInt8 {
     case failure = 5
     case success = 6
     case requestIdentities = 11
@@ -15,14 +18,22 @@ final class SSHAgent {
     case `extension` = 27
   }
 
+  /// keyfob's own agent extensions (SSH_AGENTC_EXTENSION names)
+  enum Extension {
+    /// purpose ("credentials" | "age"), key handle, peer public key, context
+    static let agree = "keyfob-agree@flaky.build"
+    static let lock = "keyfob-lock@flaky.build"
+    static let status = "keyfob-status@flaky.build"
+  }
+
   /// Idle or slow clients each hold a thread; cap them.
   private static let maxConnections = 64
   private let connectionLock = NSLock()
   private var connections = 0
 
   private let socketPath: String
-  /// One Touch ID sheet at a time
-  private let signLock = NSLock()
+  /// One Touch ID sheet at a time; also guards the Unlocker children
+  private let keyLock = NSLock()
 
   init(socketPath: String) {
     self.socketPath = socketPath
@@ -30,6 +41,26 @@ final class SSHAgent {
 
   func run() throws -> Never {
     signal(SIGPIPE, SIG_IGN)
+    let server = try listen()
+    log("listening on \(socketPath)")
+    Thread.detachNewThread { [self] in acceptLoop(server) }
+
+    // Forget every approval when the screen locks or the Mac sleeps
+    let forget: (Notification) -> Void = { [self] notification in
+      keyLock.lock()
+      Unlocker.stopAll()
+      keyLock.unlock()
+      log("approvals cleared: \(notification.name.rawValue)")
+    }
+    DistributedNotificationCenter.default().addObserver(
+      forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: nil,
+      using: forget)
+    NSWorkspace.shared.notificationCenter.addObserver(
+      forName: NSWorkspace.willSleepNotification, object: nil, queue: nil, using: forget)
+    while true { RunLoop.main.run() }
+  }
+
+  private func listen() throws -> Int32 {
     // Not ensureDirectory: the socket may live in a shared directory like /tmp
     try FileManager.default.createDirectory(
       at: URL(fileURLWithPath: socketPath).deletingLastPathComponent(),
@@ -38,7 +69,6 @@ final class SSHAgent {
 
     let server = socket(AF_UNIX, SOCK_STREAM, 0)
     guard server >= 0 else { throw posixError("socket") }
-
     var address = sockaddr_un()
     address.sun_family = sa_family_t(AF_UNIX)
     let pathBytes = Array(socketPath.utf8)
@@ -48,7 +78,6 @@ final class SSHAgent {
     withUnsafeMutableBytes(of: &address.sun_path) { buffer in
       buffer.copyBytes(from: pathBytes)
     }
-
     let previousMask = umask(0o177)
     let bound = withUnsafePointer(to: &address) {
       $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -57,9 +86,11 @@ final class SSHAgent {
     }
     umask(previousMask)
     guard bound == 0 else { throw posixError("bind \(socketPath)") }
-    guard listen(server, 16) == 0 else { throw posixError("listen") }
+    guard Darwin.listen(server, 16) == 0 else { throw posixError("listen") }
+    return server
+  }
 
-    log("listening on \(socketPath)")
+  private func acceptLoop(_ server: Int32) {
     while true {
       let client = accept(server, nil, nil)
       if client < 0 {
@@ -111,7 +142,6 @@ final class SSHAgent {
   private func handle(_ request: Data, connection: Connection) -> Data {
     var reader = SSHReader(request)
     guard let type = try? reader.byte() else { return failure() }
-    let peer = connection.peer
 
     switch Message(rawValue: type) {
     case .requestIdentities:
@@ -128,56 +158,133 @@ final class SSHAgent {
       return writer.data
 
     case .extension:
-      // string "session-bind@openssh.com", string hostkey, string session id,
-      // string signature, bool is_forwarding
-      guard (try? reader.text()) == "session-bind@openssh.com",
-        (try? reader.string()) != nil, (try? reader.string()) != nil,
+      return handleExtension(&reader, connection: connection)
+
+    case .signRequest:
+      guard let keyBlob = try? reader.string(), let data = try? reader.string(),
+        let key = Key.all(.ssh).first(where: {
+          (try? $0.signingPublicKey()).map(SSHKey.blob) == keyBlob
+        }),
+        let handle = try? Data(contentsOf: key.handle)
+      else { return failure() }
+      let peer = connection.peer
+      // Also forwarded: anything else reaching us through the local ssh
+      // client, which itself only ever signs logins, and only after binding
+      let viaSSH = peer.chain.first?.name == "ssh"
+      let forwarded =
+        connection.forwarded || (viaSSH && (SignRequest.loginUser(data) == nil || !connection.bound))
+      let request = SignRequest(data: data, caller: peer, key: key, forwarded: forwarded)
+      guard
+        let raw = use(
+          .sign, handle: handle, protection: key.protection, payload: data,
+          action: request.action, operation: request.operation, caller: peer),
+        let signature = try? P256.Signing.ECDSASignature(rawRepresentation: raw)
+      else { return failure() }
+      var writer = SSHWriter()
+      writer.byte(Message.signResponse.rawValue)
+      writer.string(SSHKey.signature(signature))
+      return writer.data
+
+    default:
+      return failure()
+    }
+  }
+
+  private func handleExtension(_ reader: inout SSHReader, connection: Connection) -> Data {
+    switch try? reader.text() {
+    case "session-bind@openssh.com":
+      // string hostkey, string session id, string signature, bool is_forwarding
+      guard (try? reader.string()) != nil, (try? reader.string()) != nil,
         (try? reader.string()) != nil, let forwarding = try? reader.byte()
       else { return failure() }
       connection.bound = true
       if forwarding != 0 { connection.forwarded = true }
       return Data([Message.success.rawValue])
 
-    case .signRequest:
-      do {
-        let keyBlob = try reader.string()
-        let data = try reader.string()
-        guard
-          let key = Key.all(.ssh).first(where: {
-            (try? $0.signingPublicKey()).map(SSHKey.blob) == keyBlob
-          })
-        else { return failure() }
-
-        // Also forwarded: anything else reaching us through the local ssh
-        // client, which itself only ever signs logins, and only after binding
-        let viaSSH = peer.chain.first?.name == "ssh"
-        let forwarded =
-          connection.forwarded || (viaSSH && (SignRequest.loginUser(data) == nil || !connection.bound))
-        let request = SignRequest(data: data, caller: peer, key: key, forwarded: forwarded)
-        signLock.lock()
-        defer { signLock.unlock() }
-        do {
-          let app = peer.displayApp
-          let (signature, reused) = try Persona.sign(
-            data, with: key, reason: peer.reason(request.action, speaker: Persona.fileName(app)),
-            as: app, reuseScope: request.reuseScope)
-          AuditLog.record(request.action, caller: peer, outcome: reused ? "reused" : "allowed")
-
-          var writer = SSHWriter()
-          writer.byte(Message.signResponse.rawValue)
-          writer.string(SSHKey.signature(signature))
-          return writer.data
-        } catch {
-          AuditLog.record(request.action, caller: peer, outcome: "denied")
-          throw error
-        }
-      } catch {
-        log("sign refused: \(error.localizedDescription)")
+    case Extension.agree:
+      // Only local keyfob clients: never through ssh (a forwarded agent)
+      guard !connection.forwarded, connection.peer.chain.first?.name != "ssh",
+        let purpose = try? reader.text(),
+        let clientHandle = try? reader.string(), let share = try? reader.string(),
+        let context = try? reader.text()
+      else { return failure() }
+      let peer = connection.peer
+      let handle: Data
+      let protection: Protection
+      let action: String
+      let operation: Reuse.Operation
+      switch purpose {
+      case "credentials":
+        // Always our own credentials key, whatever the client sent
+        guard let own = try? Data(contentsOf: Paths.credentialsKey) else { return failure() }
+        let parts = context.split(separator: "\u{0}", omittingEmptySubsequences: false)
+        let url = parts.first.map(String.init) ?? ""
+        let user = parts.count > 1 ? String(parts[1]) : ""
+        handle = own
+        protection = SecureEnclaveKeys.credentialsProtection
+        action = Prompt.gitCredentials(peer, url: url)
+        operation = .gitCredentials(host: URLComponents(string: url)?.host ?? url, user: user)
+      case "age":
+        // Any age-plugin-se identity of this Mac; keyfob's own carry a protection
+        let key = Key.age(matching: clientHandle)
+        handle = clientHandle
+        protection = key?.protection ?? .dangerous
+        action = Prompt.ageDecrypt(peer, key: key)
+        operation = .ageDecrypt
+      default:
         return failure()
       }
+      guard
+        let secret = use(
+          .agree, handle: handle, protection: protection, payload: share, action: action,
+          operation: operation, caller: peer)
+      else { return failure() }
+      var writer = SSHWriter()
+      writer.byte(Message.success.rawValue)
+      writer.string(secret)
+      return writer.data
+
+    case Extension.lock:
+      keyLock.lock()
+      Unlocker.stopAll()
+      keyLock.unlock()
+      return Data([Message.success.rawValue])
+
+    case Extension.status:
+      keyLock.lock()
+      let active = Unlocker.active
+      keyLock.unlock()
+      var writer = SSHWriter()
+      writer.byte(Message.success.rawValue)
+      writer.string(active.joined(separator: "\n"))
+      return writer.data
 
     default:
       return failure()
+    }
+  }
+
+  /// One key use: Touch ID unless the policy lets an earlier approval cover
+  /// it, audit log either way. Nil when denied.
+  private func use(
+    _ mode: Persona.Mode, handle: Data, protection: Protection, payload: Data, action: String,
+    operation: Reuse.Operation, caller: Caller
+  ) -> Data? {
+    let grant = Reuse.grant(operation, caller: caller, keyHandle: handle, protection: protection)
+    let text = grant.map { action + "\n" + $0.promptLine } ?? action
+    let app = caller.displayApp
+    keyLock.lock()
+    defer { keyLock.unlock() }
+    do {
+      let (result, reused) = try Persona.unlock(
+        mode, handle: handle, protection: protection, payload: payload,
+        reason: caller.reason(text, speaker: Persona.fileName(app)), as: app, grant: grant)
+      AuditLog.record(action, caller: caller, outcome: reused ? "reused" : "allowed")
+      return result
+    } catch {
+      AuditLog.record(action, caller: caller, outcome: "denied")
+      log("refused: \(error.localizedDescription)")
+      return nil
     }
   }
 
@@ -237,14 +344,11 @@ extension Caller {
   }
 }
 
-/// A signature request: the action shown on the Touch ID sheet, and how far
-/// an approval of it may be reused.
+/// An SSH signature request: the action shown on the Touch ID sheet, and
+/// what kind of operation it is for the reuse policy.
 struct SignRequest {
   let action: String
-  /// Requests sharing a scope reuse one approval of a normal key for a few
-  /// minutes; nil means always ask. A scope is one app process, one key and
-  /// one kind of action (signing in a repository, logging in to a host).
-  let reuseScope: String?
+  let operation: Reuse.Operation
 
   /// Username of an SSH_MSG_USERAUTH_REQUEST publickey signature, nil for
   /// anything else (SSHSIG file/commit signatures, …).
@@ -269,34 +373,138 @@ struct SignRequest {
         : namespace.map { "sign data for \($0)" }
         ?? user.map { "log in over SSH as \($0)" } ?? "sign SSH data"
       action = Prompt.forwarded(caller, action: what, key: key)
-      reuseScope = nil
+      operation = .always
       return
     }
-
-    let instance = caller.appInstance.map { "\($0)\u{0}\(key.fingerprint)" }
     if let namespace {
       guard namespace == "git" else {
         action = Prompt.lines("sign data for \(namespace)", [], key: key.promptLine)
-        reuseScope = nil
+        operation = .always
         return
       }
       let tag = caller.gitSubcommand == "tag"
       action = Prompt.gitSigning(caller, tag: tag, key: key)
-      // Tags mark releases: always ask
-      reuseScope = tag ? nil : instance.map { "\($0)\u{0}sign\u{0}\(caller.repositoryPath ?? "")" }
+      operation = .gitSign(tag: tag)
       return
     }
-
     if let user {
       action = Prompt.sshLogin(caller, user: user, key: key)
-      // Destructive pushes deserve their own look: always ask
-      let destructive = caller.push.map { $0.force || $0.delete } ?? false
-      let host = caller.sshEndpoint.map { "\(user)@\($0.host):\($0.port)" }
-      reuseScope =
-        destructive ? nil : instance.flatMap { i in host.map { "\(i)\u{0}login\u{0}\($0)" } }
+      operation = .sshLogin(target: caller.sshEndpoint.map { "\(user)@\($0.host):\($0.port)" })
       return
     }
     action = Prompt.lines("sign SSH data", [("🔧", caller.initiatorLabel)], key: key.promptLine)
-    reuseScope = nil
+    operation = .always
+  }
+}
+
+/// Client side of the keyfob agent extensions, used by `keyfob lock` and
+/// `status`, the git credential helper and the age plugin.
+enum AgentClient {
+  enum Answer {
+    case result(Data)
+    case denied
+    /// No agent listening: the caller does the work itself
+    case unavailable
+  }
+
+  static var socketPath: String {
+    ProcessInfo.processInfo.environment["KEYFOB_AGENT_SOCKET"].flatMap { $0.isEmpty ? nil : $0 }
+      ?? Paths.agentSocket.path
+  }
+
+  static var isAvailable: Bool {
+    let fd = connect()
+    if fd >= 0 { close(fd) }
+    return fd >= 0
+  }
+
+  /// ECDH with a Secure Enclave key, Touch ID and reuse decided by the agent.
+  static func agree(purpose: String, handle: Data, share: Data, context: String) -> Answer {
+    var writer = SSHWriter()
+    writer.byte(SSHAgent.Message.extension.rawValue)
+    writer.string(SSHAgent.Extension.agree)
+    writer.string(purpose)
+    writer.string(handle)
+    writer.string(share)
+    writer.string(context)
+    guard let response = send(writer.data) else { return .unavailable }
+    var reader = SSHReader(response)
+    guard (try? reader.byte()) == SSHAgent.Message.success.rawValue,
+      let secret = try? reader.string()
+    else { return .denied }
+    return .result(secret)
+  }
+
+  static func lock() -> Bool {
+    var writer = SSHWriter()
+    writer.byte(SSHAgent.Message.extension.rawValue)
+    writer.string(SSHAgent.Extension.lock)
+    return send(writer.data)?.first == SSHAgent.Message.success.rawValue
+  }
+
+  static func status() -> [String]? {
+    var writer = SSHWriter()
+    writer.byte(SSHAgent.Message.extension.rawValue)
+    writer.string(SSHAgent.Extension.status)
+    guard let response = send(writer.data) else { return nil }
+    var reader = SSHReader(response)
+    guard (try? reader.byte()) == SSHAgent.Message.success.rawValue,
+      let text = try? reader.text()
+    else { return nil }
+    return text.isEmpty ? [] : text.components(separatedBy: "\n")
+  }
+
+  private static func connect() -> Int32 {
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else { return -1 }
+    var address = sockaddr_un()
+    address.sun_family = sa_family_t(AF_UNIX)
+    let pathBytes = Array(socketPath.utf8)
+    guard pathBytes.count < MemoryLayout.size(ofValue: address.sun_path) else {
+      close(fd)
+      return -1
+    }
+    withUnsafeMutableBytes(of: &address.sun_path) { $0.copyBytes(from: pathBytes) }
+    let connected = withUnsafePointer(to: &address) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+      }
+    }
+    guard connected == 0 else {
+      close(fd)
+      return -1
+    }
+    return fd
+  }
+
+  /// One request and its response; nil when no agent answers.
+  private static func send(_ message: Data) -> Data? {
+    let fd = connect()
+    guard fd >= 0 else { return nil }
+    defer { close(fd) }
+    var framed = SSHWriter()
+    framed.string(message)
+    let bytes = [UInt8](framed.data)
+    var done = 0
+    while done < bytes.count {
+      let n = bytes.withUnsafeBytes { write(fd, $0.baseAddress! + done, bytes.count - done) }
+      if n <= 0 { return nil }
+      done += n
+    }
+    func readExactly(_ count: Int) -> Data? {
+      var buffer = [UInt8](repeating: 0, count: count)
+      var got = 0
+      while got < count {
+        let n = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress! + got, count - got) }
+        if n <= 0 { return nil }
+        got += n
+      }
+      return Data(buffer)
+    }
+    // No read timeout: the agent may be waiting for the user's finger
+    guard let header = readExactly(4) else { return nil }
+    let length = header.reduce(0) { $0 << 8 | Int($1) }
+    guard length > 0, length <= 1 << 20 else { return nil }
+    return readExactly(length)
   }
 }

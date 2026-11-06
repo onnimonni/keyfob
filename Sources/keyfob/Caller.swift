@@ -1,4 +1,5 @@
 import Darwin
+import Security
 import Foundation
 
 /// Who is asking: the chain of processes behind a request, condensed for the
@@ -125,6 +126,50 @@ struct Caller {
   /// within it: another program merely named `claude` does not share them.
   var appInstance: String? {
     appProcess.map { "\($0.pid)@\($0.started)" }
+  }
+
+  /// The session inside the app: a coding agent's own process (one agent
+  /// session), else the terminal tab's `login`, else the outermost shell the
+  /// app started. A malicious script in another tab is another session.
+  var sessionInstance: String? {
+    let session: Process?
+    if let agent = chain.first(where: { Caller.agentName($0) != nil }) {
+      session = agent
+    } else if let appIndex = chain.firstIndex(where: { Caller.bundleName($0) != nil }) {
+      let below = chain[..<appIndex]
+      session = below.first { $0.name == "login" } ?? below.last { Caller.shells.contains($0.name) }
+    } else {
+      session = nil
+    }
+    return (session ?? appProcess).map { "\($0.pid)@\($0.started)" }
+  }
+
+  /// Code signing identity of the app process: `team:ABCDE12345` for signed
+  /// apps, `cdhash:…` for ad-hoc signed binaries (e.g. from nix), nil when the
+  /// running code fails validation. Another binary merely named like the app
+  /// has a different identity.
+  var codeIdentity: String? {
+    appProcess.flatMap { Caller.codeIdentity(pid: $0.pid) }
+  }
+
+  private static func codeIdentity(pid: pid_t) -> String? {
+    var code: SecCode?
+    let attributes = [kSecGuestAttributePid: pid] as CFDictionary
+    guard SecCodeCopyGuestWithAttributes(nil, attributes, [], &code) == errSecSuccess, let code,
+      SecCodeCheckValidity(code, [], nil) == errSecSuccess
+    else { return nil }
+    var staticCode: SecStaticCode?
+    var information: CFDictionary?
+    guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode,
+      SecCodeCopySigningInformation(
+        staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
+      let info = information as? [String: Any]
+    else { return nil }
+    if let team = info[kSecCodeInfoTeamIdentifier as String] as? String { return "team:\(team)" }
+    if let hash = info[kSecCodeInfoUnique as String] as? Data {
+      return "cdhash:" + hash.prefix(10).map { String(format: "%02x", $0) }.joined()
+    }
+    return nil
   }
 
   /// Name the Touch ID sheet is titled with: the app, or `unknown` so an
@@ -350,10 +395,12 @@ struct Caller {
     process.gitSubcommand.map { "git \($0)" } ?? process.name
   }
 
-  private static let plumbing: Set<String> = [
+  private static let shells: Set<String> = ["sh", "bash", "zsh", "dash", "fish", "nu", "tcsh"]
+
+  private static let plumbing: Set<String> = shells.union([
     "keyfob", "git-credential-keyfob", "age-plugin-se", "xcrun", "ssh", "ssh-keygen",
-    "timeout", "env", "nice", "coreutils", "sh", "bash", "zsh", "dash", "fish", "login",
-  ]
+    "timeout", "env", "nice", "coreutils", "login",
+  ])
 
   private static func isPlumbing(_ process: Process) -> Bool {
     plumbing.contains(process.name)

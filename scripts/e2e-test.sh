@@ -9,7 +9,7 @@ trap 'kill "${AGENT:-}" 2>/dev/null || true; rm -rf "$WORK" "$SOCK"' EXIT
 
 mkdir "$WORK/bin"
 for name in keyfob git-credential-keyfob age-plugin-se; do ln -s "$BIN" "$WORK/bin/$name"; done
-export PATH="$WORK/bin:$PATH" KEYFOB_HOME="$WORK/home" SSH_AUTH_SOCK="$SOCK"
+export PATH="$WORK/bin:$PATH" KEYFOB_HOME="$WORK/home" SSH_AUTH_SOCK="$SOCK" KEYFOB_AGENT_SOCKET="$SOCK"
 
 keyfob init --insecure-no-touch-id >/dev/null
 keyfob new ssh second --insecure-no-touch-id >/dev/null
@@ -49,5 +49,30 @@ printf 'protocol=https\nhost=example.com\nusername=eve\n' | git credential-keyfo
 [ -n "$(printf 'protocol=https\nhost=example.com\n' | git credential-keyfob get)" ]
 printf 'protocol=https\nhost=example.com\n' | git credential-keyfob erase
 [ -z "$(printf 'protocol=https\nhost=example.com\n' | git credential-keyfob get)" ]
+
+
+echo "approvals: git credentials and age reuse through the agent"
+printf 'protocol=https\nhost=example.com\nusername=bob\npassword=tok\n' | git credential-keyfob store
+for _ in 1 2; do printf 'protocol=https\nhost=example.com\n' | git credential-keyfob get >/dev/null; done
+grep -q ' reused git credential\| reused use Git credentials' "$KEYFOB_HOME/audit.log"
+echo "secret" | age -r "$(keyfob age-recipient)" -o "$WORK/secret.age"
+for _ in 1 2; do age -d -i "$KEYFOB_HOME/age/default.txt" "$WORK/secret.age" >/dev/null; done
+grep -q ' reused decrypt a file using age' "$KEYFOB_HOME/audit.log"
+
+echo "status and lock"
+keyfob status | grep -q 'commits in'
+keyfob lock >/dev/null
+[ "$(keyfob status)" = "no remembered approvals" ]
+git -C "$WORK/repo" -c user.name=t -c user.email=t@t commit -q --allow-empty -m after-lock
+[ "$(grep 'sign a Git commit' "$KEYFOB_HOME/audit.log" | tail -1 | cut -d' ' -f2)" = allowed ]
+
+echo "install-ssh-config"
+mkdir -p "$WORK/fakehome/.ssh"
+printf 'Host *\n  IdentityAgent /somewhere/else\n' >"$WORK/fakehome/.ssh/config"
+HOME="$WORK/fakehome" keyfob install-ssh-config >/dev/null
+HOME="$WORK/fakehome" keyfob install-ssh-config >/dev/null
+[ "$(grep -c "^Include $KEYFOB_HOME/ssh_config" "$WORK/fakehome/.ssh/config")" = 1 ]
+[ "$(sed -n 2p "$WORK/fakehome/.ssh/config")" = "Include $KEYFOB_HOME/ssh_config" ]
+[ -f "$WORK/fakehome/.ssh/config.keyfob-backup" ]
 
 echo "ok"

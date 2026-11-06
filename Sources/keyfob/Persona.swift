@@ -66,110 +66,106 @@ enum Persona {
     // execv only returns on failure: carry on as keyfob
   }
 
-  // MARK: SSH signatures
+  // MARK: Unlocking keys
 
-  /// How long one approval of a normal SSH key lasts within a reuse scope.
-  static let reuseSeconds: TimeInterval = 300
+  /// What a child does with an unlocked Secure Enclave key.
+  enum Mode: String {
+    /// ECDSA signature (SSH), payload = data to sign
+    case sign
+    /// ECDH (git credentials, age), payload = peer public key, x963
+    case agree
+  }
 
   enum Outcome: UInt8 {
     case approved, reused, expired, denied
   }
 
-  /// The SSH agent is long-running, so signatures happen in child processes
-  /// started from the copy named after the app. A request with a reuse scope
-  /// (see SignRequest) on a normal key goes to that scope's long-lived child,
-  /// which reuses its approval for `reuseSeconds`; anything else, including
-  /// every dangerous key, gets a fresh child and asks again.
-  static func sign(
-    _ data: Data, with key: Key, reason: String, as app: String, reuseScope: String?
-  ) throws -> (signature: P256.Signing.ECDSASignature, reused: Bool) {
-    guard key.protection != .dangerous, let reuseScope else {
-      return (try signInFreshChild(data, with: key, reason: reason, as: app), false)
+  /// Uses a Secure Enclave key in a child process started from the copy
+  /// named after the app, so the Touch ID sheet carries the app's name.
+  /// With a grant, the scope's long-lived child reuses its approval until the
+  /// grant ends; without one, a fresh child asks and exits.
+  static func unlock(
+    _ mode: Mode, handle: Data, protection: Protection, payload: Data, reason: String,
+    as app: String, grant: Reuse.Grant?
+  ) throws -> (result: Data, reused: Bool) {
+    guard let grant else {
+      let child = try Unlocker(mode: mode, handle: handle, protection: protection, seconds: 0, app: app)
+      defer { child.stop() }
+      let (outcome, result) = child.request(payload, reason: reason)
+      guard outcome == .approved, let result else { throw KeyfobError("denied") }
+      return (result, false)
     }
-
-    // A child whose approval expired answers `expired`: retry with a new one
+    // A child whose approval ended answers `expired`: retry with a new one
     for _ in 0..<2 {
-      let signer = try Signer.running(scope: reuseScope, app: app, key: key)
-      let (outcome, signature) = signer.sign(data, reason: reason)
+      let child = try Unlocker.running(
+        grant: grant, mode: mode, handle: handle, protection: protection, app: app)
+      let (outcome, result) = child.request(payload, reason: reason)
       switch outcome {
       case .approved, .reused:
-        if let signature { return (signature, outcome == .reused) }
-        Signer.stop(scope: reuseScope)
+        if let result { return (result, outcome == .reused) }
+        Unlocker.stop(scope: grant.scope)
       case .expired:
-        Signer.stop(scope: reuseScope)
+        Unlocker.stop(scope: grant.scope)
       case .denied:
-        Signer.stop(scope: reuseScope)
-        throw KeyfobError("signing was denied")
+        Unlocker.stop(scope: grant.scope)
+        throw KeyfobError("denied")
       }
     }
-    throw KeyfobError("signer did not respond")
+    throw KeyfobError("unlocker did not respond")
   }
 
-  private static func signInFreshChild(_ data: Data, with key: Key, reason: String, as app: String)
-    throws -> P256.Signing.ECDSASignature
-  {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: try executable(named: app))
-    process.arguments = ["__sign", key.name, reason]
-    let input = Pipe()
-    let output = Pipe()
-    process.standardInput = input
-    process.standardOutput = output
-    try process.run()
-    // Throwing write: the legacy one raises an uncatchable exception on EPIPE
-    try? input.fileHandleForWriting.write(contentsOf: data)
-    try? input.fileHandleForWriting.close()
-    let signature = output.fileHandleForReading.readDataToEndOfFile()
-    process.waitUntilExit()
-    guard process.terminationStatus == 0 else { throw KeyfobError("signing was denied") }
-    return try P256.Signing.ECDSASignature(rawRepresentation: signature)
-  }
-
-  /// Fresh child: data on stdin, raw signature on stdout.
-  static func signOnce(keyName: String, reason: String) throws {
-    guard let key = Key.named(.ssh, keyName) else { throw KeyfobError("no SSH key '\(keyName)'") }
-    let data = FileHandle.standardInput.readDataToEndOfFile()
-    let signature = try key.loadSigningKey(context: SecureEnclaveKeys.context(reason: reason))
-      .signature(for: data)
-    try FileHandle.standardOutput.write(contentsOf: signature.rawRepresentation)
-  }
-
-  /// Long-lived child for one reuse scope: answers framed (reason, data)
-  /// requests. The first asks for Touch ID or the password; later ones reuse
-  /// that approval for `reuseSeconds`, then the child exits.
-  static func serveSignatures(keyName: String) throws {
-    guard let key = Key.named(.ssh, keyName) else { throw KeyfobError("no SSH key '\(keyName)'") }
-    // Dangerous keys must ask every time, whoever starts this
-    guard key.protection != .dangerous else { throw KeyfobError("'\(keyName)' is dangerous") }
+  /// Child side (`__unlock MODE PROTECTION SECONDS`): reads the key handle,
+  /// then answers framed (reason, payload) requests. The first asks for
+  /// Touch ID (or the password for normal keys); later ones reuse that
+  /// approval for SECONDS, after which the child exits.
+  static func serveUnlocks(mode: Mode, protection: Protection, seconds: TimeInterval) throws {
     let input = FileHandle.standardInput
     let output = FileHandle.standardOutput
-    var unlocked: SecureEnclave.P256.Signing.PrivateKey?
+    guard let handle = Frame.read(from: input) else { return }
+    // Dangerous keys ask every time, whoever starts this
+    let seconds = protection == .dangerous ? 0 : min(max(seconds, 0), 600)
+    var unlocked: ((Data) throws -> Data)?
     var deadline = Date.distantFuture
 
-    func respond(_ outcome: Outcome, _ signature: P256.Signing.ECDSASignature? = nil) {
+    func respond(_ outcome: Outcome, _ result: Data = Data()) {
       try? output.write(contentsOf: Data([outcome.rawValue]))
-      Frame.write(signature?.rawRepresentation ?? Data(), to: output)
+      Frame.write(result, to: output)
     }
 
-    while let reason = Frame.read(from: input), let data = Frame.read(from: input) {
+    while let reason = Frame.read(from: input), let payload = Frame.read(from: input) {
       if Date() > deadline {
         respond(.expired)
         return
       }
       do {
         if let unlocked {
-          respond(.reused, try unlocked.signature(for: data))
+          respond(.reused, try unlocked(payload))
           continue
         }
         let context = SecureEnclaveKeys.context(reason: String(decoding: reason, as: UTF8.self))
-        if key.protection != .none { try authenticate(context) }
-        let privateKey = try key.loadSigningKey(context: context)
-        let signature = try privateKey.signature(for: data)
-        unlocked = privateKey
-        deadline = Date().addingTimeInterval(reuseSeconds)
+        if protection != .none { try authenticate(context, biometricOnly: protection != .normal) }
+        let use: (Data) throws -> Data
+        switch mode {
+        case .sign:
+          let key = try SecureEnclave.P256.Signing.PrivateKey(
+            dataRepresentation: handle, authenticationContext: context)
+          use = { try key.signature(for: $0).rawRepresentation }
+        case .agree:
+          let key = try SecureEnclave.P256.KeyAgreement.PrivateKey(
+            dataRepresentation: handle, authenticationContext: context)
+          use = {
+            try key.sharedSecretFromKeyAgreement(
+              with: P256.KeyAgreement.PublicKey(x963Representation: $0)
+            ).withUnsafeBytes { Data($0) }
+          }
+        }
+        let result = try use(payload)
+        respond(.approved, result)
+        guard seconds > 0 else { return }
+        unlocked = use
+        deadline = Date().addingTimeInterval(seconds)
         // Do not keep an unlocked key around after the approval ends
-        DispatchQueue.global().asyncAfter(deadline: .now() + reuseSeconds) { exit(0) }
-        respond(.approved, signature)
+        DispatchQueue.global().asyncAfter(deadline: .now() + seconds) { exit(0) }
       } catch {
         respond(.denied)
         return
@@ -177,12 +173,14 @@ enum Persona {
     }
   }
 
-  /// Touch ID or password once, so the context can sign without asking again.
-  private static func authenticate(_ context: LAContext) throws {
+  /// Touch ID (or password) once, so the context can use the key without
+  /// asking again. Touch ID only keys need a biometric evaluation.
+  private static func authenticate(_ context: LAContext, biometricOnly: Bool) throws {
     let done = DispatchSemaphore(value: 0)
     var failure: Error?
     context.evaluatePolicy(
-      .deviceOwnerAuthentication, localizedReason: context.localizedReason
+      biometricOnly ? .deviceOwnerAuthenticationWithBiometrics : .deviceOwnerAuthentication,
+      localizedReason: context.localizedReason
     ) { success, error in
       if !success { failure = error ?? KeyfobError("authentication failed") }
       done.signal()
@@ -192,18 +190,24 @@ enum Persona {
   }
 }
 
-/// A running `__signer` child, kept by the SSH agent per reuse scope.
-final class Signer {
-  private static var children: [String: Signer] = [:]
+/// A running `__unlock` child. The agent keeps one per reuse scope; callers
+/// serialize access (the agent handles one key use at a time).
+final class Unlocker {
+  private static var children: [String: Unlocker] = [:]
 
   private let process: Process
   private let input: FileHandle
   private let output: FileHandle
+  private var summary = ""
+  private var approvedAt: Date?
+  private var seconds: TimeInterval = 0
 
-  private init(app: String, key: Key) throws {
+  fileprivate init(mode: Persona.Mode, handle: Data, protection: Protection, seconds: TimeInterval, app: String)
+    throws
+  {
     process = Process()
     process.executableURL = URL(fileURLWithPath: try Persona.executable(named: app))
-    process.arguments = ["__signer", key.name]
+    process.arguments = ["__unlock", mode.rawValue, protection.rawValue, String(Int(seconds))]
     let inputPipe = Pipe()
     let outputPipe = Pipe()
     process.standardInput = inputPipe
@@ -211,32 +215,57 @@ final class Signer {
     try process.run()
     input = inputPipe.fileHandleForWriting
     output = outputPipe.fileHandleForReading
+    self.seconds = seconds
+    Frame.write(handle, to: input)
   }
 
-  /// Callers serialize access (the agent signs one request at a time).
-  static func running(scope: String, app: String, key: Key) throws -> Signer {
-    if let signer = children[scope], signer.process.isRunning { return signer }
-    let signer = try Signer(app: app, key: key)
-    children[scope] = signer
-    return signer
+  fileprivate static func running(
+    grant: Reuse.Grant, mode: Persona.Mode, handle: Data, protection: Protection, app: String
+  ) throws -> Unlocker {
+    if let child = children[grant.scope], child.process.isRunning { return child }
+    let child = try Unlocker(
+      mode: mode, handle: handle, protection: protection, seconds: grant.seconds, app: app)
+    child.summary = grant.summary
+    children[grant.scope] = child
+    return child
   }
 
   static func stop(scope: String) {
-    children.removeValue(forKey: scope)?.process.terminate()
+    children.removeValue(forKey: scope)?.stop()
   }
 
-  func sign(_ data: Data, reason: String) -> (Persona.Outcome, P256.Signing.ECDSASignature?) {
+  /// `keyfob lock`, screen lock and sleep: forget every approval.
+  static func stopAll() {
+    children.values.forEach { $0.stop() }
+    children.removeAll()
+  }
+
+  /// Approvals still in force, for `keyfob status`.
+  static var active: [String] {
+    children.values.compactMap { child in
+      guard child.process.isRunning, let approvedAt = child.approvedAt else { return nil }
+      let left = Int(child.seconds - Date().timeIntervalSince(approvedAt))
+      return left > 0 ? "\(child.summary) (\(left)s left)" : nil
+    }.sorted()
+  }
+
+  fileprivate func stop() {
+    if process.isRunning { process.terminate() }
+  }
+
+  fileprivate func request(_ payload: Data, reason: String) -> (Persona.Outcome, Data?) {
     Frame.write(Data(reason.utf8), to: input)
-    Frame.write(data, to: input)
+    Frame.write(payload, to: input)
     guard let status = Frame.readExactly(1, from: output),
       let outcome = Persona.Outcome(rawValue: status[0]),
-      let raw = Frame.read(from: output)
+      let result = Frame.read(from: output)
     else { return (.expired, nil) }
-    return (outcome, raw.isEmpty ? nil : try? P256.Signing.ECDSASignature(rawRepresentation: raw))
+    if outcome == .approved { approvedAt = Date() }
+    return (outcome, result.isEmpty ? nil : result)
   }
 }
 
-/// Length-prefixed messages between the agent and its signer children.
+/// Length-prefixed messages between the agent and its children.
 enum Frame {
   static func write(_ data: Data, to handle: FileHandle) {
     var length = UInt32(data.count).bigEndian

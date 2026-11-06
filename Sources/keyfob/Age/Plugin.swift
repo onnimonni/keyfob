@@ -361,14 +361,13 @@ class Plugin {
               // Compresed representation cannot be the identity point anyway (?)
               // Therefore, the shared secret cannot be all 0x00 bytes, so we don't need
               // to explicitly check this here.
-              let sharedSecret = try identity.p256PrivateKey
-                .sharedSecretFromKeyAgreement(
-                  with: shareKey)
-              wrapKey = sharedSecret.hkdfDerivedSymmetricKey(
-                using: SHA256.self,
+              let sharedSecret = try identity.p256PrivateKey.sharedSecretData(with: shareKey)
+              // keyfob: same HKDF as SharedSecret.hkdfDerivedSymmetricKey
+              wrapKey = HKDF<SHA256>.deriveKey(
+                inputKeyMaterial: SymmetricKey(data: sharedSecret),
                 salt: shareKeyData
                   + identity.recipient.p256PublicKey.compressedRepresentation,
-                sharedInfo: Data("piv-p256".utf8),
+                info: Data("piv-p256".utf8),
                 outputByteCount: 32
               )
               nonce = try! ChaChaPoly.Nonce(data: Data(count: 12))

@@ -27,7 +27,7 @@ credentials key. Add more with `keyfob new ssh|age NAME [--dangerous]`:
 | | normal | `--dangerous` |
 |---|---|---|
 | Unlock | Touch ID or password | Touch ID only |
-| SSH agent | one approval covers 5 minutes of the same request kind (signing in one repo, logging in to one host) from the same app process; never for tags, FORCE pushes or requests forwarded with `ssh -A` | every use |
+| Approvals remembered | yes, see below | never: every use asks |
 | Fingerprints change | key keeps working | key is destroyed |
 | Touch ID sheet | names the key unless it is `default` | 🚨 names the key, right under the title |
 
@@ -43,6 +43,32 @@ Host prod-*
 
 Decrypt with a named age key: `age -d -i ~/.config/keyfob/age/prod.txt`.
 
+## Remembered approvals
+
+The agent is the one place that unlocks keys: SSH signing, and also git
+credentials and age decryption, which the credential helper and age plugin
+send to it (they ask Touch ID themselves only when no agent runs). It may
+remember one approval for a few minutes, but only for the same scope:
+
+| Request | Remembered | Scope |
+|---|---|---|
+| commit signing | 5 min | app process + session + code identity + key + repository |
+| SSH login, normal push, fetch | 5 min | … + `user@host:port` |
+| HTTPS fetch, pull, normal push | 5 min | … + host + username |
+| age / sops decrypt | 2 min | … + age identity + project directory |
+| FORCE push or branch delete, tags, other signatures | never | |
+| requests forwarded with `ssh -A`, unknown apps, dangerous keys | never | |
+
+- **Session**: the coding agent process (one `claude` session), else the
+  terminal tab's `login`, else the outermost shell the app started. A script in
+  another tab is another session.
+- **Code identity**: the app's signing team ID, or its cdhash when ad-hoc
+  signed (e.g. installed with nix); code that fails validation is never
+  remembered.
+- A remembered approval ends after its time, when the screen locks, when the
+  Mac sleeps, or with `keyfob lock`. `keyfob status` lists the active ones.
+- The Touch ID sheet says so: its last line reads `⏱️ remembered for 5 min`.
+
 ## Install
 
 ### Nix + home-manager
@@ -55,9 +81,10 @@ inputs.keyfob.url = "github:onnimonni/keyfob";
 imports = [ inputs.keyfob.homeManagerModules.default ];
 programs.keyfob = {
   enable = true;
-  # sshAgent = true;  # launchd agent + SSH_AUTH_SOCK (default)
-  # git = true;       # include signing + credential config (default: programs.git.enable)
-  # sops = true;      # SOPS_AGE_KEY_FILE = the 'default' age key
+  # sshAgent = true;   # launchd agent + SSH_AUTH_SOCK (default)
+  # sshConfig = true;  # Include in ~/.ssh/config (default: programs.ssh.enable)
+  # git = true;        # include signing + credential config (default: programs.git.enable)
+  # sops = true;       # SOPS_AGE_KEY_FILE = the 'default' age key
 };
 ```
 
@@ -74,8 +101,15 @@ swift build -c release
 install -m755 .build/release/keyfob /usr/local/bin/keyfob
 ln -s keyfob /usr/local/bin/git-credential-keyfob
 ln -s keyfob /usr/local/bin/age-plugin-se
-keyfob init   # prints the remaining setup steps
+keyfob init                   # keys and config snippets
+keyfob install-launch-agent   # agent at login
+keyfob install-ssh-config     # plain `ssh` uses the agent
 ```
+
+`keyfob install-ssh-config` puts `Include ~/.config/keyfob/ssh_config` at the
+top of `~/.ssh/config` (so its `IdentityAgent` wins over later ones), once,
+keeping a backup. It refuses a symlinked config (nix, dotfiles): add the line
+there, or use the home-manager `sshConfig` option.
 
 ## Usage
 
@@ -84,12 +118,15 @@ keyfob init                           create the 'default' keys and config snipp
 keyfob new ssh|age NAME [--dangerous] create another key
 keyfob delete ssh|age NAME            delete a key (it is gone for good)
 keyfob list                           show keys and public keys
+keyfob status                         show approvals the agent still remembers
+keyfob lock                           forget all approvals now
 keyfob ssh-pubkey [NAME]              print an SSH public key
 keyfob age-recipient [NAME]           print an age recipient (age1se1...)
-keyfob ssh-agent [--socket PATH]      run the SSH agent in the foreground
+keyfob ssh-agent [--socket PATH]      run the agent in the foreground
+keyfob install-ssh-config             use the agent from ~/.ssh/config
+keyfob install-launch-agent           start the agent at login (LaunchAgent)
 keyfob env                            print SSH_AUTH_SOCK and SOPS_AGE_KEY_FILE exports
 keyfob log                            show recent Touch ID requests and who made them
-keyfob install-launch-agent           write a LaunchAgent that runs the SSH agent
 keyfob git-credential get|store|erase
 ```
 
@@ -143,7 +180,7 @@ cosmetic: any program can name its executable anything. The real story is in
 | `ssh/NAME.key`, `ssh/NAME.pub` | SSH key handle and public key |
 | `age/NAME.txt` | age identity (age-plugin-se format) |
 | `*/NAME.json` | key protection |
-| `credentials.key` | key that git credentials are encrypted to |
+| `credentials.key`, `credentials.protection` | key that git credentials are encrypted to |
 | `credentials/` | encrypted git credentials, one file per host |
 | `gitconfig` | include: signing with `ssh/default.pub`, credential helper |
 | `ssh_config` | include setting `IdentityAgent` |

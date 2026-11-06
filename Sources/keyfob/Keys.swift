@@ -244,6 +244,18 @@ enum SecureEnclaveKeys {
     let key = try SecureEnclave.P256.KeyAgreement.PrivateKey(
       accessControl: protection.accessControl())
     try Paths.writePrivate(key.dataRepresentation, to: Paths.credentialsKey)
+    try Paths.writePrivate(Data(protection.rawValue.utf8), to: credentialsProtectionFile)
+  }
+
+  /// Protection of the git credentials key; Touch ID only when unrecorded.
+  static var credentialsProtection: Protection {
+    (try? String(contentsOf: credentialsProtectionFile, encoding: .utf8))
+      .flatMap { Protection(rawValue: $0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+      ?? .touchID
+  }
+
+  private static var credentialsProtectionFile: URL {
+    Paths.home.appendingPathComponent("credentials.protection")
   }
 
   static func loadAgreementKey(reason: String) throws

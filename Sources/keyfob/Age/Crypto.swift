@@ -65,8 +65,9 @@ protocol SecureEnclaveP256PrivateKey {
   var publicKey: P256.KeyAgreement.PublicKey { get }
   var dataRepresentation: Data { get }
 
-  func sharedSecretFromKeyAgreement(with publicKeyShare: P256.KeyAgreement.PublicKey) throws
-    -> SharedSecret
+  // keyfob: raw bytes instead of SharedSecret, so the key agreement can
+  // happen in the keyfob agent (SharedSecret cannot be rebuilt from bytes)
+  func sharedSecretData(with publicKeyShare: P256.KeyAgreement.PublicKey) throws -> Data
 }
 
 protocol SecureEnclaveMLKEM768PrivateKey {
@@ -141,6 +142,9 @@ protocol SecureEnclaveMLKEM768PrivateKey {
   }
 
   extension SecureEnclave.P256.KeyAgreement.PrivateKey: SecureEnclaveP256PrivateKey {
+    func sharedSecretData(with publicKeyShare: P256.KeyAgreement.PublicKey) throws -> Data {
+      try sharedSecretFromKeyAgreement(with: publicKeyShare).withUnsafeBytes { Data($0) }
+    }
   }
 
   #if compiler(>=6.2)

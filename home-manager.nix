@@ -25,6 +25,17 @@ in
       description = "Run the keyfob SSH agent with launchd and point SSH_AUTH_SOCK at it.";
     };
 
+    sshConfig = lib.mkOption {
+      type = lib.types.bool;
+      default = config.programs.ssh.enable;
+      defaultText = lib.literalExpression "config.programs.ssh.enable";
+      description = ''
+        Include keyfob's ssh config (IdentityAgent = the keyfob agent) at the top of
+        ~/.ssh/config through programs.ssh. Without programs.ssh, run
+        `keyfob install-ssh-config` once instead.
+      '';
+    };
+
     git = lib.mkOption {
       type = lib.types.bool;
       default = config.programs.git.enable;
@@ -63,6 +74,10 @@ in
           };
         };
         home.sessionVariables.SSH_AUTH_SOCK = "${keyfobHome}/agent.sock";
+      })
+
+      (lib.mkIf cfg.sshConfig {
+        programs.ssh.includes = [ "${keyfobHome}/ssh_config" ];
       })
 
       (lib.mkIf cfg.git {

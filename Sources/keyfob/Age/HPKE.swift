@@ -70,8 +70,7 @@ enum HPKE {
     let shareKey = try P256.KeyAgreement.PublicKey(x963Representation: enc)
     let sharedSecret = HPKE.extractAndExpand(
       suiteID: "KEM".data(using: .utf8)! + Data([0x00, 0x10]),
-      dh: (try recipientKey.sharedSecretFromKeyAgreement(with: shareKey))
-        .withUnsafeBytes { Data($0) },
+      dh: try recipientKey.sharedSecretData(with: shareKey),
       kemContext: enc + recipientKey.publicKey.x963Representation,
       nSecret: 32)
     return sharedSecret
@@ -125,13 +124,12 @@ enum HPKE {
       let encT = enc[1088...]
 
       let sharedSecretPQ = try recipientMLKEM768Key.decapsulate(encPQ)
-      let sharedSecretT =
-        (try recipientP256Key.sharedSecretFromKeyAgreement(
-          with: try P256.KeyAgreement.PublicKey(x963Representation: Data(encT))))
+      let sharedSecretT = try recipientP256Key.sharedSecretData(
+        with: try P256.KeyAgreement.PublicKey(x963Representation: Data(encT)))
 
       var sharedSecret = SHA3_256()
       sharedSecret.update(data: sharedSecretPQ.withUnsafeBytes { Data($0) })
-      sharedSecret.update(data: sharedSecretT.withUnsafeBytes { Data($0) })
+      sharedSecret.update(data: sharedSecretT)
       sharedSecret.update(data: encT)
       sharedSecret.update(data: recipientP256Key.publicKey.x963Representation)
       sharedSecret.update(data: "MLKEM768-P256".data(using: .utf8)!)
