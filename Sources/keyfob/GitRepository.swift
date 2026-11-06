@@ -15,7 +15,7 @@ struct GitRepository {
       if FileManager.default.fileExists(atPath: dotGit.path, isDirectory: &isDirectory) {
         if isDirectory.boolValue {
           gitDirectory = dotGit
-        } else if let pointer = try? String(contentsOf: dotGit, encoding: .utf8),
+        } else if let pointer = GitRepository.read(dotGit),
           pointer.hasPrefix("gitdir: ")
         {
           let path = pointer.dropFirst(8).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -27,7 +27,7 @@ struct GitRepository {
     }
     guard let gitDirectory else { return nil }
 
-    let head = try? String(contentsOf: gitDirectory.appendingPathComponent("HEAD"), encoding: .utf8)
+    let head = GitRepository.read(gitDirectory.appendingPathComponent("HEAD"))
     branch = head.flatMap {
       let ref = $0.trimmingCharacters(in: .whitespacesAndNewlines)
       return ref.hasPrefix("ref: refs/heads/") ? String(ref.dropFirst(16)) : nil
@@ -35,16 +35,25 @@ struct GitRepository {
 
     // Linked worktrees keep config in the common directory
     var common = gitDirectory
-    if let pointer = try? String(
-      contentsOf: gitDirectory.appendingPathComponent("commondir"), encoding: .utf8)
+    if let pointer = GitRepository.read(gitDirectory.appendingPathComponent("commondir"))
     {
       common = URL(
         fileURLWithPath: pointer.trimmingCharacters(in: .whitespacesAndNewlines),
         relativeTo: gitDirectory
       ).standardizedFileURL
     }
-    origin = (try? String(contentsOf: common.appendingPathComponent("config"), encoding: .utf8))
+    origin = GitRepository.read(common.appendingPathComponent("config"))
       .flatMap(GitRepository.originURL)
+  }
+
+  /// A file in `.git`, only if it is a small regular file: a FIFO or device
+  /// planted in a repository must not block the agent.
+  private static func read(_ url: URL) -> String? {
+    var status = stat()
+    guard lstat(url.path, &status) == 0, status.st_mode & S_IFMT == S_IFREG,
+      status.st_size <= 1 << 20
+    else { return nil }
+    return try? String(contentsOf: url, encoding: .utf8)
   }
 
   /// `url` of `[remote "origin"]` in a git config file.

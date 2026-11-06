@@ -37,9 +37,13 @@ class Keyfob < Formula
         keyfob install-ssh-config       # plain `ssh` uses the agent
         git config --global include.path ~/.config/keyfob/gitconfig
 
-      sudo with a Touch ID sheet naming the command: add to the top of
-      /etc/pam.d/sudo_local
-        auth       sufficient     #{opt_lib}/pam/pam_keyfob.so
+      sudo with a Touch ID sheet naming the command. sudo runs the module as
+      root, so copy it somewhere only root can write (never load it from
+      #{HOMEBREW_PREFIX}, which your user can change), again after upgrades:
+        sudo install -d -o root -g wheel -m 755 /usr/local/lib/pam
+        sudo install -o root -g wheel -m 444 #{opt_lib}/pam/pam_keyfob.so /usr/local/lib/pam/
+      then add to the top of /etc/pam.d/sudo_local:
+        auth       sufficient     /usr/local/lib/pam/pam_keyfob.so
     EOS
   end
 

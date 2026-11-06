@@ -4,12 +4,20 @@ import Foundation
 /// then one emoji-marked fact per line. Every value is caller-controlled and
 /// cleaned to a single line, so callers cannot add lines of their own.
 enum Prompt {
-  static func gitSigning(_ caller: Caller, tag: Bool, key: Key) -> String {
+  /// `object` is what the signature verifiably covers (nil: unverified, no
+  /// subject shown).
+  static func gitSigning(_ caller: Caller, object: Caller.SignedObject?, key: Key) -> String {
     let repository = caller.repositoryPath.flatMap(GitRepository.init(workTree:))
+    let title =
+      switch object?.kind {
+      case .commit: "sign a Git commit"
+      case .tag: "sign a Git tag"
+      default: "sign Git data"
+      }
     return lines(
-      tag ? "sign a Git tag" : "sign a Git commit",
+      title,
       [
-        ("📝", caller.signedSubject),
+        ("📝", object?.subject),
         ("📁", caller.repository),
         ("📦", repository?.origin.map(GitRepository.shortRemote)),
       ],

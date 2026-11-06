@@ -35,6 +35,16 @@ in
     lib.mkMerge [
       { environment.systemPackages = [ cfg.package ]; }
 
+      {
+        # Denying keyfob's sheet would fall through to pam_tid's generic one,
+        # which is easy to approve by reflex without seeing the command
+        warnings = lib.optional (cfg.sudo && sudoLocal.touchIdAuth) ''
+          programs.keyfob.sudo and security.pam.services.sudo_local.touchIdAuth are both on:
+          denying keyfob's Touch ID sheet shows Apple's generic one next. Set
+          touchIdAuth = false; the password stays as fallback.
+        '';
+      }
+
       (lib.mkIf cfg.sudo {
         security.pam.services.sudo_local = {
           enable = true;

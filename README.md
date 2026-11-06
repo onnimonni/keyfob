@@ -52,11 +52,11 @@ remember one approval for a few minutes, but only for the same scope:
 
 | Request | Remembered | Scope |
 |---|---|---|
-| commit signing | 5 min | app process + session + code identity + key + repository |
-| SSH login, normal push, fetch | 5 min | … + `user@host:port` |
-| HTTPS fetch, pull, normal push | 5 min | … + host + username |
+| commit signing (verified commits only) | 5 min | app process + session + code identity + key + repository |
+| SSH login, fetch | 5 min | … + user + host key of the bound session |
+| HTTPS fetch, pull, clone | 5 min | … + host + username |
 | age / sops decrypt | 2 min | … + age identity + project directory |
-| FORCE push or branch delete, tags, other signatures | never | |
+| any push, tags, unverified or other signatures | never | |
 | requests forwarded with `ssh -A`, unknown apps, dangerous keys | never | |
 
 - **Session**: the coding agent process (one `claude` session), else the
@@ -68,6 +68,34 @@ remember one approval for a few minutes, but only for the same scope:
 - A remembered approval ends after its time, when the screen locks, when the
   Mac sleeps, or with `keyfob lock`. `keyfob status` lists the active ones.
 - The Touch ID sheet says so: its last line reads `⏱️ remembered for 5 min`.
+
+## Threat model
+
+keyfob guards against a key being used without you noticing: by a remote host
+you reached with `ssh -A`, by an app or script that runs a command you did not
+mean to approve, or by someone with the key files but not your Mac. The private
+keys never leave the Secure Enclave, and every first use needs Touch ID (or
+your password, for normal keys).
+
+It does **not** defend against malware already running as your user. Such a
+program can read the key handles in `~/.config/keyfob` and ask the Secure
+Enclave itself, edit key metadata, replace the app-named copies in
+`~/.config/keyfob/bin`, or pose as another app on the Touch ID sheet. macOS
+offers no boundary between programs of the same user that an unsigned command
+line tool could use. The Touch ID sheet and the audit log are context for you,
+not proof of who asked.
+
+Within that model the agent:
+- reuses an approval only in its scope (see Remembered approvals); a git
+  signature counts as a commit only after its content was checked against the
+  hash being signed, and an SSH login only for the host key ssh actually
+  reached in that session;
+- never reuses one for pushes, FORCE pushes, tags, forwarded requests or
+  unknown apps;
+- decrypts git credentials itself and returns only plaintext that
+  authenticates against the requested host;
+- answers forwarded agents (`ssh -A`) only with SSH signatures, each asked
+  for, never with decryption, `lock` or `status`.
 
 ## Install
 
@@ -127,8 +155,18 @@ keyfob install-ssh-config     # plain `ssh` uses the agent
 git config --global include.path ~/.config/keyfob/gitconfig
 ```
 
-For sudo, add to the top of `/etc/pam.d/sudo_local`:
-`auth sufficient /opt/homebrew/lib/pam/pam_keyfob.so`.
+For sudo, copy the module somewhere only root can write: sudo runs it as
+root, and `/opt/homebrew` is writable by your user, so loading it from there
+would let any program you run replace code that runs as root. Repeat after
+upgrades:
+
+```sh
+sudo install -d -o root -g wheel -m 755 /usr/local/lib/pam
+sudo install -o root -g wheel -m 444 "$(brew --prefix keyfob)/lib/pam/pam_keyfob.so" /usr/local/lib/pam/
+```
+
+then add `auth sufficient /usr/local/lib/pam/pam_keyfob.so` to the top of
+`/etc/pam.d/sudo_local`.
 It conflicts with Homebrew's `age-plugin-se` formula, which keyfob replaces.
 
 ### make (manual)
@@ -237,6 +275,10 @@ sudo is trying to run as root:
 📁 ~/Projects
 🤖 requested by claude.
 ```
+
+sudo runs the module as root, so it must live where only root can write, along
+the whole path (the nix store, or `/usr/local/lib/pam` installed with `sudo`),
+never in a directory your user owns such as `/opt/homebrew`.
 
 Add it as `sufficient` at the top of `/etc/pam.d/sudo_local`, so denying,
 cancelling or any error falls through to the next line and sudo keeps working:

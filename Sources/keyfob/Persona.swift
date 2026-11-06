@@ -36,8 +36,16 @@ enum Persona {
     let source = ownPath
     let target = directory.appendingPathComponent(fileName(app)).path
     let manager = FileManager.default
-    if manager.fileExists(atPath: target), manager.contentsEqual(atPath: source, andPath: target) {
-      return target
+    // Only a regular file of ours counts; a symlink, directory or other
+    // owner's file in its place is removed and replaced
+    var status = stat()
+    if lstat(target, &status) == 0 {
+      if status.st_mode & S_IFMT == S_IFREG, status.st_uid == getuid(),
+        manager.contentsEqual(atPath: source, andPath: target)
+      {
+        return target
+      }
+      try? manager.removeItem(atPath: target)
     }
     try Paths.ensureDirectory(directory)
     let temporary = target + ".\(getpid()).tmp"
@@ -194,6 +202,11 @@ enum Persona {
 /// serialize access (the agent handles one key use at a time).
 final class Unlocker {
   private static var children: [String: Unlocker] = [:]
+  /// Guards `children` on its own, so `lock`, `status` and screen lock never
+  /// wait behind a Touch ID sheet that is still open
+  private static let childrenLock = NSLock()
+  /// How long a sheet may stay unanswered before the request is denied
+  private static let answerTimeout: Int32 = 120_000
 
   private let process: Process
   private let input: FileHandle
@@ -201,6 +214,8 @@ final class Unlocker {
   private var summary = ""
   private var approvedAt: Date?
   private var seconds: TimeInterval = 0
+  /// Set by `lock`/screen lock: a pending request is then denied, not retried
+  private var stopped = false
 
   fileprivate init(mode: Persona.Mode, handle: Data, protection: Protection, seconds: TimeInterval, app: String)
     throws
@@ -222,6 +237,8 @@ final class Unlocker {
   fileprivate static func running(
     grant: Reuse.Grant, mode: Persona.Mode, handle: Data, protection: Protection, app: String
   ) throws -> Unlocker {
+    childrenLock.lock()
+    defer { childrenLock.unlock() }
     if let child = children[grant.scope], child.process.isRunning { return child }
     let child = try Unlocker(
       mode: mode, handle: handle, protection: protection, seconds: grant.seconds, app: app)
@@ -231,18 +248,26 @@ final class Unlocker {
   }
 
   static func stop(scope: String) {
-    children.removeValue(forKey: scope)?.stop()
+    childrenLock.lock()
+    let child = children.removeValue(forKey: scope)
+    childrenLock.unlock()
+    child?.stop()
   }
 
   /// `keyfob lock`, screen lock and sleep: forget every approval.
   static func stopAll() {
-    children.values.forEach { $0.stop() }
+    childrenLock.lock()
+    let all = Array(children.values)
     children.removeAll()
+    childrenLock.unlock()
+    all.forEach { $0.stop() }
   }
 
   /// Approvals still in force, for `keyfob status`.
   static var active: [String] {
-    children.values.compactMap { child in
+    childrenLock.lock()
+    defer { childrenLock.unlock() }
+    return children.values.compactMap { child in
       guard child.process.isRunning, let approvedAt = child.approvedAt else { return nil }
       let left = Int(child.seconds - Date().timeIntervalSince(approvedAt))
       return left > 0 ? "\(child.summary) (\(left)s left)" : nil
@@ -250,13 +275,20 @@ final class Unlocker {
   }
 
   fileprivate func stop() {
+    stopped = true
     if process.isRunning { process.terminate() }
   }
 
   fileprivate func request(_ payload: Data, reason: String) -> (Persona.Outcome, Data?) {
     Frame.write(Data(reason.utf8), to: input)
     Frame.write(payload, to: input)
-    guard let status = Frame.readExactly(1, from: output),
+    // The answer waits on the user: bounded, and a stop means denied
+    var ready = pollfd(fd: output.fileDescriptor, events: Int16(POLLIN), revents: 0)
+    if poll(&ready, 1, Unlocker.answerTimeout) <= 0 {
+      stop()
+      return (.denied, nil)
+    }
+    guard !stopped, let status = Frame.readExactly(1, from: output),
       let outcome = Persona.Outcome(rawValue: status[0]),
       let result = Frame.read(from: output)
     else { return (.expired, nil) }

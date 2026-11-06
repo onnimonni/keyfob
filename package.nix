@@ -8,7 +8,7 @@
 
 stdenv.mkDerivation {
   pname = "keyfob";
-  version = "0.3.0";
+  version = "0.3.1";
 
   src = lib.cleanSource ./.;
 

@@ -20,8 +20,10 @@ final class SSHAgent {
 
   /// keyfob's own agent extensions (SSH_AGENTC_EXTENSION names)
   enum Extension {
-    /// purpose ("credentials" | "age"), key handle, peer public key, context
+    /// purpose ("age"), key handle, peer public key, context| "age"), key handle, peer public key, context
     static let agree = "keyfob-agree@flaky.build"
+    /// credential file id (URL) and its contents; answer: verified plaintext
+    static let credential = "keyfob-credential@flaky.build"
     static let lock = "keyfob-lock@flaky.build"
     static let status = "keyfob-status@flaky.build"
   }
@@ -47,9 +49,7 @@ final class SSHAgent {
 
     // Forget every approval when the screen locks or the Mac sleeps
     let forget: (Notification) -> Void = { [self] notification in
-      keyLock.lock()
       Unlocker.stopAll()
-      keyLock.unlock()
       log("approvals cleared: \(notification.name.rawValue)")
     }
     DistributedNotificationCenter.default().addObserver(
@@ -57,6 +57,10 @@ final class SSHAgent {
       using: forget)
     NSWorkspace.shared.notificationCenter.addObserver(
       forName: NSWorkspace.willSleepNotification, object: nil, queue: nil, using: forget)
+    // Fast user switching away from this account
+    NSWorkspace.shared.notificationCenter.addObserver(
+      forName: NSWorkspace.sessionDidResignActiveNotification, object: nil, queue: nil,
+      using: forget)
     while true { RunLoop.main.run() }
   }
 
@@ -123,15 +127,31 @@ final class SSHAgent {
   /// One client connection. ssh (8.9+) sends session-bind@openssh.com before
   /// using the agent, with a flag when it is relaying a forwarded agent.
   private final class Connection {
-    let peer: Caller
+    /// Recomputed for every request: a connection kept open must not keep the
+    /// identity of a session that has ended
+    var peer: Caller
     var bound = false
     var forwarded = false
+    /// From session-bind: the server's host key and the session id
+    var hostKey: Data?
+    var session: Data?
     init(peer: Caller) { self.peer = peer }
+
+    /// A keyfob client on this Mac, not a forwarded agent: never through ssh
+    var isLocalClient: Bool { !forwarded && peer.chain.first?.name != "ssh" }
   }
+
+  /// Connections are short (ssh connects per authentication); a long-lived one
+  /// only holds a slot
+  private static let maxConnectionSeconds: TimeInterval = 600
 
   private func serve(_ fd: Int32) {
     let connection = Connection(peer: Caller(socket: fd))
-    while let request = readMessage(fd) {
+    let opened = Date()
+    while Date().timeIntervalSince(opened) < SSHAgent.maxConnectionSeconds,
+      let request = readMessage(fd)
+    {
+      connection.peer = Caller(socket: fd)
       let response = handle(request, connection: connection)
       var framed = SSHWriter()
       framed.string(response)
@@ -173,7 +193,9 @@ final class SSHAgent {
       let viaSSH = peer.chain.first?.name == "ssh"
       let forwarded =
         connection.forwarded || (viaSSH && (SignRequest.loginUser(data) == nil || !connection.bound))
-      let request = SignRequest(data: data, caller: peer, key: key, forwarded: forwarded)
+      let request = SignRequest(
+        data: data, caller: peer, key: key, forwarded: forwarded, hostKey: connection.hostKey,
+        session: connection.session)
       guard
         let raw = use(
           .sign, handle: handle, protection: key.protection, payload: data,
@@ -193,67 +215,81 @@ final class SSHAgent {
   private func handleExtension(_ reader: inout SSHReader, connection: Connection) -> Data {
     switch try? reader.text() {
     case "session-bind@openssh.com":
-      // string hostkey, string session id, string signature, bool is_forwarding
-      guard (try? reader.string()) != nil, (try? reader.string()) != nil,
+      // string hostkey, string session id, string signature, bool is_forwarding.
+      // The host key is the server ssh really reached, whatever argv says.
+      guard let hostKey = try? reader.string(), let session = try? reader.string(),
         (try? reader.string()) != nil, let forwarding = try? reader.byte()
       else { return failure() }
       connection.bound = true
+      connection.hostKey = hostKey
+      connection.session = session
       if forwarding != 0 { connection.forwarded = true }
       return Data([Message.success.rawValue])
 
     case Extension.agree:
-      // Only local keyfob clients: never through ssh (a forwarded agent)
-      guard !connection.forwarded, connection.peer.chain.first?.name != "ssh",
-        let purpose = try? reader.text(),
-        let clientHandle = try? reader.string(), let share = try? reader.string(),
-        let context = try? reader.text()
+      // age only, and only keyfob's own age keys (never the credentials key);
+      // other identities get an empty answer and prompt in their own process
+      guard connection.isLocalClient, (try? reader.text()) == "age",
+        let handle = try? reader.string(), let share = try? reader.string(),
+        (try? reader.text()) != nil
       else { return failure() }
-      let peer = connection.peer
-      let handle: Data
-      let protection: Protection
-      let action: String
-      let operation: Reuse.Operation
-      switch purpose {
-      case "credentials":
-        // Always our own credentials key, whatever the client sent
-        guard let own = try? Data(contentsOf: Paths.credentialsKey) else { return failure() }
-        let parts = context.split(separator: "\u{0}", omittingEmptySubsequences: false)
-        let url = parts.first.map(String.init) ?? ""
-        let user = parts.count > 1 ? String(parts[1]) : ""
-        handle = own
-        protection = SecureEnclaveKeys.credentialsProtection
-        action = Prompt.gitCredentials(peer, url: url)
-        operation = .gitCredentials(host: URLComponents(string: url)?.host ?? url, user: user)
-      case "age":
-        // Any age-plugin-se identity of this Mac; keyfob's own carry a protection
-        let key = Key.age(matching: clientHandle)
-        handle = clientHandle
-        protection = key?.protection ?? .dangerous
-        action = Prompt.ageDecrypt(peer, key: key)
-        operation = .ageDecrypt
-      default:
-        return failure()
+      let credentialsKey = try? Data(contentsOf: Paths.credentialsKey)
+      guard handle != credentialsKey, let key = Key.age(matching: handle) else {
+        var writer = SSHWriter()
+        writer.byte(Message.success.rawValue)
+        writer.string(Data())
+        return writer.data
       }
+      let peer = connection.peer
       guard
         let secret = use(
-          .agree, handle: handle, protection: protection, payload: share, action: action,
-          operation: operation, caller: peer)
+          .agree, handle: handle, protection: key.protection, payload: share,
+          action: Prompt.ageDecrypt(peer, key: key), operation: .ageDecrypt, caller: peer)
       else { return failure() }
       var writer = SSHWriter()
       writer.byte(Message.success.rawValue)
       writer.string(secret)
       return writer.data
 
+    case Extension.credential:
+      // The agent opens the credential file itself: the ECDH secret never
+      // leaves it, and plaintext comes back only when the file authenticates
+      // against this id (the host the approval and the prompt name)
+      guard connection.isLocalClient, let id = try? reader.text(),
+        let sealed = try? reader.string(),
+        let handle = try? Data(contentsOf: Paths.credentialsKey)
+      else { return failure() }
+      let peer = connection.peer
+      let user = GitCredential.storedUsername(sealed) ?? ""
+      let action = Prompt.gitCredentials(peer, url: id)
+      let operation = Reuse.Operation.gitCredentials(
+        host: URLComponents(string: id)?.host ?? id, user: user)
+      guard
+        let plaintext = try? GitCredential.open(sealed, id: id, agree: { share in
+          guard
+            let secret = use(
+              .agree, handle: handle, protection: SecureEnclaveKeys.credentialsProtection,
+              payload: share.x963Representation, action: action, operation: operation,
+              caller: peer)
+          else { throw KeyfobError("denied") }
+          return secret
+        })
+      else { return failure() }
+      var writer = SSHWriter()
+      writer.byte(Message.success.rawValue)
+      writer.string(plaintext)
+      return writer.data
+
     case Extension.lock:
-      keyLock.lock()
+      // Not for a forwarded agent: a remote host must not clear local approvals
+      guard connection.isLocalClient else { return failure() }
       Unlocker.stopAll()
-      keyLock.unlock()
       return Data([Message.success.rawValue])
 
     case Extension.status:
-      keyLock.lock()
+      // Not for a forwarded agent: approvals name local repos and apps
+      guard connection.isLocalClient else { return failure() }
       let active = Unlocker.active
-      keyLock.unlock()
       var writer = SSHWriter()
       writer.byte(Message.success.rawValue)
       writer.string(active.joined(separator: "\n"))
@@ -361,7 +397,10 @@ struct SignRequest {
   /// `forwarded`: the request comes from another machine through `ssh -A`.
   /// The local process chain says nothing about it, so the sheet shows only
   /// what is asked and where it came from, and it never reuses an approval.
-  init(data: Data, caller: Caller, key: Key, forwarded: Bool) {
+  /// `hostKey`/`session` come from ssh's session-bind: an SSH login reuses an
+  /// approval only for the server that really answered (its host key), and
+  /// only when the signed login belongs to that bound session.
+  init(data: Data, caller: Caller, key: Key, forwarded: Bool, hostKey: Data?, session: Data?) {
     let namespace: String? =
       data.starts(with: Data("SSHSIG".utf8))
       ? { var reader = SSHReader(data.dropFirst(6)); return (try? reader.text()) ?? "" }() : nil
@@ -382,14 +421,25 @@ struct SignRequest {
         operation = .always
         return
       }
-      let tag = caller.gitSubcommand == "tag"
-      action = Prompt.gitSigning(caller, tag: tag, key: key)
-      operation = .gitSign(tag: tag)
+      // Reused only for a commit whose content was checked against the hash
+      // being signed; tags, other objects and anything unverified always ask
+      let object = caller.signedObject(data)
+      action = Prompt.gitSigning(caller, object: object, key: key)
+      operation = .gitSign(verifiedCommit: object?.kind == .commit)
       return
     }
     if let user {
       action = Prompt.sshLogin(caller, user: user, key: key)
-      operation = .sshLogin(target: caller.sshEndpoint.map { "\(user)@\($0.host):\($0.port)" })
+      var loginSession = SSHReader(data)
+      let signedSession = try? loginSession.string()
+      // Pushes (git-receive-pack, whatever alias or config started them) ask
+      let push = caller.sshRemoteService == "git-receive-pack"
+      if !push, let hostKey, let session, signedSession == session {
+        let fingerprint = Data(SHA256.hash(data: hostKey)).base64EncodedString()
+        operation = .sshLogin(target: "\(user)@SHA256:\(fingerprint)")
+      } else {
+        operation = .sshLogin(target: nil)
+      }
       return
     }
     action = Prompt.lines("sign SSH data", [("🔧", caller.initiatorLabel)], key: key.promptLine)
@@ -432,7 +482,23 @@ enum AgentClient {
     guard (try? reader.byte()) == SSHAgent.Message.success.rawValue,
       let secret = try? reader.string()
     else { return .denied }
-    return .result(secret)
+    // Empty: not one of keyfob's keys, use it in this process
+    return secret.isEmpty ? .unavailable : .result(secret)
+  }
+
+  /// Decrypted, verified git credential file contents.
+  static func credential(id: String, sealed: Data) -> Answer {
+    var writer = SSHWriter()
+    writer.byte(SSHAgent.Message.extension.rawValue)
+    writer.string(SSHAgent.Extension.credential)
+    writer.string(id)
+    writer.string(sealed)
+    guard let response = send(writer.data) else { return .unavailable }
+    var reader = SSHReader(response)
+    guard (try? reader.byte()) == SSHAgent.Message.success.rawValue,
+      let plaintext = try? reader.string()
+    else { return .denied }
+    return .result(plaintext)
   }
 
   static func lock() -> Bool {

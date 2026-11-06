@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 
-let version = "0.3.0"
+let version = "0.3.1"
 
 let usage = """
   keyfob \(version): Secure Enclave keys for SSH, git and age, unlocked with Touch ID

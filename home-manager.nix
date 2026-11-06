@@ -74,10 +74,24 @@ in
           };
         };
         home.sessionVariables.SSH_AUTH_SOCK = "${keyfobHome}/agent.sock";
+        # GUI apps (git signing in editors) do not read shell variables
+        launchd.agents.keyfob-environment = {
+          enable = true;
+          config = {
+            ProgramArguments = [
+              "/bin/launchctl"
+              "setenv"
+              "SSH_AUTH_SOCK"
+              "${keyfobHome}/agent.sock"
+            ];
+            RunAtLoad = true;
+          };
+        };
       })
 
       (lib.mkIf cfg.sshConfig {
-        programs.ssh.includes = [ "${keyfobHome}/ssh_config" ];
+        # First, so its IdentityAgent wins over later includes
+        programs.ssh.includes = lib.mkBefore [ "${keyfobHome}/ssh_config" ];
       })
 
       (lib.mkIf cfg.git {

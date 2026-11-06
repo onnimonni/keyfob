@@ -1,4 +1,5 @@
 import Darwin
+import CryptoKit
 import Security
 import Foundation
 
@@ -172,6 +173,17 @@ struct Caller {
     return nil
   }
 
+  /// Approvals are only reused for apps that are not just any binary with a
+  /// familiar name: signed by a developer team, or installed where only root
+  /// can write (/Applications, /System, /usr, the nix store).
+  var appIsTrusted: Bool {
+    guard let process = appProcess else { return false }
+    if codeIdentity?.hasPrefix("team:") == true { return true }
+    return ["/Applications/", "/System/", "/usr/", "/nix/store/"].contains {
+      process.path.hasPrefix($0)
+    }
+  }
+
   /// Name the Touch ID sheet is titled with: the app, or `unknown` so an
   /// unrecognised caller stands out.
   var displayApp: String { app ?? "unknown" }
@@ -291,6 +303,9 @@ struct Caller {
     guard let ssh = chain.first(where: { $0.name == "ssh" }) else { return nil }
     var port = "22"
     var destination: String?
+    // `-o HostName=…`/`-o Port=…` override the destination on the command line
+    var optionHost: String?
+    var optionPort: String?
     var rest = ssh.arguments.dropFirst()[...]
     while let argument = rest.popFirst() {
       if argument == "--" {
@@ -307,6 +322,13 @@ struct Caller {
         let attached = String(argument.dropFirst(offset + 2))
         let value = attached.isEmpty ? rest.popFirst() ?? "" : attached
         if letter == "p" { port = value }
+        if letter == "o" {
+          let parts = value.split(separator: "=", maxSplits: 1).map {
+            $0.trimmingCharacters(in: .whitespaces)
+          }
+          if parts.count == 2, parts[0].lowercased() == "hostname" { optionHost = parts[1] }
+          if parts.count == 2, parts[0].lowercased() == "port" { optionPort = parts[1] }
+        }
         break
       }
     }
@@ -319,7 +341,7 @@ struct Caller {
       }
     }
     host = host.split(separator: "@").last.map(String.init) ?? host
-    return (host, port)
+    return (optionHost ?? host, optionPort ?? port)
   }
 
   /// URL git is talking to, from `git-remote-https origin https://…`, without
@@ -341,24 +363,56 @@ struct Caller {
     return String(command[command.index(after: start)...].prefix { $0 != "'" })
   }
 
-  /// First line of the commit or tag being signed. git hands ssh-keygen the
-  /// object in a temp file (its last argument): headers, blank line, message.
-  var signedSubject: String? {
-    guard let file = chain.first(where: { $0.name == "ssh-keygen" })?.arguments.last else {
-      return nil
-    }
-    // Only a regular file: a FIFO would block the agent thread forever
+  /// `git-upload-pack` (fetch) or `git-receive-pack` (push) from ssh's remote
+  /// command; ssh sends it to the server as is.
+  var sshRemoteService: String? {
+    guard let command = chain.first(where: { $0.name == "ssh" })?.arguments.last,
+      command.hasPrefix("git-")
+    else { return nil }
+    return String(command.prefix { $0 != " " })
+  }
+
+  /// What a Git signature covers, checked rather than assumed: git hands
+  /// ssh-keygen the object in a temp file (its last argument), and the SSHSIG
+  /// blob being signed carries the hash of the message. Only when the file's
+  /// hash matches is its type and subject shown or trusted.
+  struct SignedObject {
+    enum Kind { case commit, tag, other }
+    let kind: Kind
+    let subject: String?
+  }
+
+  func signedObject(_ sshsig: Data) -> SignedObject? {
+    // "SSHSIG", namespace, reserved, hash algorithm, H(message)
+    var reader = SSHReader(sshsig.dropFirst(6))
+    guard (try? reader.string()) != nil, (try? reader.string()) != nil,
+      let algorithm = try? reader.text(), let hash = try? reader.string(),
+      let file = chain.first(where: { $0.name == "ssh-keygen" })?.arguments.last
+    else { return nil }
+    // Only a regular file of sane size: a FIFO would block the agent thread
     var status = stat()
     guard stat(file, &status) == 0, status.st_mode & S_IFMT == S_IFREG,
-      let handle = FileHandle(forReadingAtPath: file),
-      let data = try? handle.read(upToCount: 64 * 1024)
+      status.st_size <= 16 << 20, let content = FileManager.default.contents(atPath: file)
     else { return nil }
-    let text = String(decoding: data, as: UTF8.self)
-    guard let body = text.range(of: "\n\n") else { return nil }
-    var subject = String(text[body.upperBound...].prefix { $0 != "\n" })
-    while subject.hasSuffix(".") { subject.removeLast() }
-    if subject.count > 50 { subject = subject.prefix(49) + "…" }
-    return subject.isEmpty ? nil : subject
+    let digest: Data
+    switch algorithm {
+    case "sha512": digest = Data(SHA512.hash(data: content))
+    case "sha256": digest = Data(SHA256.hash(data: content))
+    default: return nil
+    }
+    guard digest == hash else { return nil }
+
+    let text = String(decoding: content, as: UTF8.self)
+    let kind: SignedObject.Kind =
+      text.hasPrefix("tree ") ? .commit : text.hasPrefix("object ") ? .tag : .other
+    var subject: String?
+    if let body = text.range(of: "\n\n") {
+      var line = String(text[body.upperBound...].prefix { $0 != "\n" })
+      while line.hasSuffix(".") { line.removeLast() }
+      if line.count > 50 { line = line.prefix(49) + "…" }
+      subject = line.isEmpty ? nil : line
+    }
+    return SignedObject(kind: kind, subject: subject)
   }
 
   // MARK: Audit log
@@ -475,9 +529,12 @@ enum AuditLog {
     let timestamp = ISO8601DateFormatter().string(from: Date())
     let origin = caller.origin.map { " " + Caller.clean($0) } ?? ""
     let line = "\(timestamp) \(outcome) \(Caller.clean(action))\(origin) [\(caller.detail)]\n"
-    let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT, 0o600)
+    // Not through a symlink, not blocking on a FIFO, regular files only
+    let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK, 0o600)
     guard fd >= 0 else { return }
     defer { close(fd) }
+    var status = stat()
+    guard fstat(fd, &status) == 0, status.st_mode & S_IFMT == S_IFREG else { return }
     _ = line.utf8CString.withUnsafeBufferPointer { write(fd, $0.baseAddress, $0.count - 1) }
   }
 

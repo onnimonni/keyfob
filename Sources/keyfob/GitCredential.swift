@@ -32,10 +32,7 @@ enum GitCredential {
     switch operation {
     case "get":
       guard let sealed else { return }
-      let user = storedUsername(sealed) ?? request["username"] ?? ""
-      let plaintext = try open(sealed, id: id) { share in
-        try sharedSecret(with: share, id: id, user: user)
-      }
+      let plaintext = try decrypt(sealed, id: id)
       let stored = parse(plaintext)
       if let wanted = request["username"], wanted != stored["username"] { return }
       if let expiry = stored["password_expiry_utc"].flatMap(TimeInterval.init),
@@ -82,36 +79,40 @@ enum GitCredential {
       + ephemeral.publicKey.x963Representation + box.combined
   }
 
-  /// The agent unlocks the credentials key (one Touch ID policy for every key
-  /// use, approvals reused per host and user); without an agent, this process
-  /// asks itself.
-  private static func sharedSecret(with share: P256.KeyAgreement.PublicKey, id: String, user: String)
-    throws -> Data
-  {
-    switch AgentClient.agree(
-      purpose: "credentials", handle: Data(), share: share.x963Representation,
-      context: "\(id)\u{0}\(user)")
-    {
-    case .result(let secret):
-      return secret
+  /// The agent decrypts (one Touch ID policy for every key use, approvals
+  /// reused per host and user) and hands back only plaintext it verified
+  /// against this id; without an agent, this process asks itself.
+  private static func decrypt(_ sealed: Data, id: String) throws -> Data {
+    switch AgentClient.credential(id: id, sealed: sealed) {
+    case .result(let plaintext):
+      return plaintext
     case .denied:
       throw KeyfobError("denied")
     case .unavailable:
-      let caller = Caller.parent
-      let action = Prompt.gitCredentials(caller, url: id)
-      do {
-        let secret = try SecureEnclaveKeys.loadAgreementKey(reason: caller.reason(action))
-          .sharedSecretFromKeyAgreement(with: share).withUnsafeBytes { Data($0) }
-        AuditLog.record(action, caller: caller, outcome: "allowed")
-        return secret
-      } catch {
-        AuditLog.record(action, caller: caller, outcome: "denied")
-        throw error
-      }
+      return try open(sealed, id: id) { share in try localSharedSecret(with: share, id: id) }
     }
   }
 
-  private static func open(
+  private static func localSharedSecret(with share: P256.KeyAgreement.PublicKey, id: String)
+    throws -> Data
+  {
+    let caller = Caller.parent
+    let action = Prompt.gitCredentials(caller, url: id)
+    do {
+      let secret = try SecureEnclaveKeys.loadAgreementKey(reason: caller.reason(action))
+        .sharedSecretFromKeyAgreement(with: share).withUnsafeBytes { Data($0) }
+      AuditLog.record(action, caller: caller, outcome: "allowed")
+      return secret
+    } catch {
+      AuditLog.record(action, caller: caller, outcome: "denied")
+      throw error
+    }
+  }
+
+  /// Opens a credential file: ECDH with the credentials key through `agree`,
+  /// then ChaChaPoly authenticating the id and username, so a share from
+  /// another file never yields plaintext for this id.
+  static func open(
     _ sealed: Data, id: String, agree: (P256.KeyAgreement.PublicKey) throws -> Data
   ) throws -> Data {
     let body: Data
@@ -154,7 +155,7 @@ enum GitCredential {
   }
 
   /// Username of a v2 file without decrypting it; nil for v1 files.
-  private static func storedUsername(_ sealed: Data) -> String? {
+  static func storedUsername(_ sealed: Data) -> String? {
     storedUsernameData(sealed).map { String(decoding: $0, as: UTF8.self) }
   }
 

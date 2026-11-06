@@ -51,10 +51,15 @@ printf 'protocol=https\nhost=example.com\n' | git credential-keyfob erase
 [ -z "$(printf 'protocol=https\nhost=example.com\n' | git credential-keyfob get)" ]
 
 
-echo "approvals: git credentials and age reuse through the agent"
+echo "approvals: git credentials through the agent; reused only for fetches"
 printf 'protocol=https\nhost=example.com\nusername=bob\npassword=tok\n' | git credential-keyfob store
-for _ in 1 2; do printf 'protocol=https\nhost=example.com\n' | git credential-keyfob get >/dev/null; done
-grep -q ' reused git credential\| reused use Git credentials' "$KEYFOB_HOME/audit.log"
+for _ in 1 2; do
+  [ "$(printf 'protocol=https\nhost=example.com\n' | git credential-keyfob get)" = "$(printf 'username=bob\npassword=tok')" ]
+done
+# not run by a git fetch/pull/clone: may be a push, so both ask
+[ "$(grep -c ' allowed use Git credentials' "$KEYFOB_HOME/audit.log")" -ge 2 ]
+! grep -q ' reused use Git credentials' "$KEYFOB_HOME/audit.log"
+
 echo "secret" | age -r "$(keyfob age-recipient)" -o "$WORK/secret.age"
 for _ in 1 2; do age -d -i "$KEYFOB_HOME/age/default.txt" "$WORK/secret.age" >/dev/null; done
 grep -q ' reused decrypt a file using age' "$KEYFOB_HOME/audit.log"
@@ -71,8 +76,8 @@ mkdir -p "$WORK/fakehome/.ssh"
 printf 'Host *\n  IdentityAgent /somewhere/else\n' >"$WORK/fakehome/.ssh/config"
 HOME="$WORK/fakehome" keyfob install-ssh-config >/dev/null
 HOME="$WORK/fakehome" keyfob install-ssh-config >/dev/null
-[ "$(grep -c "^Include $KEYFOB_HOME/ssh_config" "$WORK/fakehome/.ssh/config")" = 1 ]
-[ "$(sed -n 2p "$WORK/fakehome/.ssh/config")" = "Include $KEYFOB_HOME/ssh_config" ]
+[ "$(grep -c "^Include \"$KEYFOB_HOME/ssh_config\"" "$WORK/fakehome/.ssh/config")" = 1 ]
+[ "$(sed -n 2p "$WORK/fakehome/.ssh/config")" = "Include \"$KEYFOB_HOME/ssh_config\"" ]
 [ -f "$WORK/fakehome/.ssh/config.keyfob-backup" ]
 
 echo "ok"
