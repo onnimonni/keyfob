@@ -16,21 +16,25 @@ enum Prompt {
       key: key.promptLine)
   }
 
+  /// A request relayed from another machine by `ssh -A`. Only what is asked
+  /// and the machine it came from (the local ssh's destination) are known.
+  static func forwarded(_ caller: Caller, action: String, key: Key) -> String {
+    let origin = caller.sshEndpoint.map { $0.port == "22" ? $0.host : "\($0.host):\($0.port)" }
+    return lines(
+      action, [("🔀", "forwarded from \(origin ?? "a remote host")")], key: key.promptLine)
+  }
+
   /// Login over SSH; for git, phrased as the git operation with the server
   /// (`github.com`, `deploy@host:2222`) and repository path on their own lines.
-  /// Requests forwarded from another machine (`ssh -A`) are called out.
-  static func sshLogin(_ caller: Caller, user: String, key: Key, forwarded: Bool) -> String {
-    let forwarding = ("🔀", forwarded ? "forwarded from a remote host" : nil)
+  static func sshLogin(_ caller: Caller, user: String, key: Key) -> String {
     // `git@` is implied for git hosting
     let login = user == "git" ? "" : "\(user)@"
     let host = caller.sshEndpoint.map {
       $0.port == "22" ? "\(login)\($0.host)" : "\(login)\($0.host):\($0.port)"
     }
-    guard !forwarded, let path = caller.sshRemoteRepository else {
+    guard let path = caller.sshRemoteRepository else {
       return lines(
-        "log in over SSH",
-        [forwarding, ("🖥️", forwarded ? "as \(user)" : host), ("🔧", caller.initiatorLabel)],
-        key: key.promptLine)
+        "log in over SSH", [("🖥️", host), ("🔧", caller.initiatorLabel)], key: key.promptLine)
     }
     return lines(
       gitTitle(caller) ?? "use Git",

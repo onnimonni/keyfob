@@ -27,7 +27,7 @@ credentials key. Add more with `keyfob new ssh|age NAME [--dangerous]`:
 | | normal | `--dangerous` |
 |---|---|---|
 | Unlock | Touch ID or password | Touch ID only |
-| SSH agent | one approval covers 5 minutes of the same request kind (signing in one repo, logging in to one host) from the same app process; never for tags, FORCE pushes or forwarded requests | every use |
+| SSH agent | one approval covers 5 minutes of the same request kind (signing in one repo, logging in to one host) from the same app process; never for tags, FORCE pushes or requests forwarded with `ssh -A` | every use |
 | Fingerprints change | key keeps working | key is destroyed |
 | Touch ID sheet | names the key unless it is `default` | 🚨 names the key, right under the title |
 
@@ -122,6 +122,11 @@ iTerm is trying to decrypt a file using age:
 📁 ~/.dotfiles
 🔧 sops.
 ```
+
+Requests forwarded from another machine (`ssh -A`) are detected from ssh's
+`session-bind@openssh.com` notice, and from anything other than a login
+reaching the agent through the local ssh client. Their sheet shows only what
+is asked and `🔀 forwarded from <host>`, and they always ask again.
 
 macOS titles the sheet with the executable's file name, so keyfob runs a copy of
 itself named after the app (`~/.config/keyfob/bin/<app>`). That title is

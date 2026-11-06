@@ -89,10 +89,11 @@ final class SSHAgent {
     }
   }
 
-  /// One client connection. ssh announces agent forwarding with the
-  /// session-bind@openssh.com extension before forwarded requests.
+  /// One client connection. ssh (8.9+) sends session-bind@openssh.com before
+  /// using the agent, with a flag when it is relaying a forwarded agent.
   private final class Connection {
     let peer: Caller
+    var bound = false
     var forwarded = false
     init(peer: Caller) { self.peer = peer }
   }
@@ -133,6 +134,7 @@ final class SSHAgent {
         (try? reader.string()) != nil, (try? reader.string()) != nil,
         (try? reader.string()) != nil, let forwarding = try? reader.byte()
       else { return failure() }
+      connection.bound = true
       if forwarding != 0 { connection.forwarded = true }
       return Data([Message.success.rawValue])
 
@@ -146,7 +148,12 @@ final class SSHAgent {
           })
         else { return failure() }
 
-        let request = SignRequest(data: data, caller: peer, key: key, forwarded: connection.forwarded)
+        // Also forwarded: anything else reaching us through the local ssh
+        // client, which itself only ever signs logins, and only after binding
+        let viaSSH = peer.chain.first?.name == "ssh"
+        let forwarded =
+          connection.forwarded || (viaSSH && (SignRequest.loginUser(data) == nil || !connection.bound))
+        let request = SignRequest(data: data, caller: peer, key: key, forwarded: forwarded)
         signLock.lock()
         defer { signLock.unlock() }
         do {
@@ -239,12 +246,35 @@ struct SignRequest {
   /// one kind of action (signing in a repository, logging in to a host).
   let reuseScope: String?
 
-  init(data: Data, caller: Caller, key: Key, forwarded: Bool) {
-    let instance = caller.appInstance.map { "\($0)\u{0}\(key.fingerprint)" }
+  /// Username of an SSH_MSG_USERAUTH_REQUEST publickey signature, nil for
+  /// anything else (SSHSIG file/commit signatures, …).
+  static func loginUser(_ data: Data) -> String? {
+    var reader = SSHReader(data)
+    guard (try? reader.string()) != nil, (try? reader.byte()) == 50 else { return nil }
+    return try? reader.text()
+  }
 
-    if data.starts(with: Data("SSHSIG".utf8)) {
-      var reader = SSHReader(data.dropFirst(6))
-      let namespace = (try? reader.text()) ?? ""
+  /// `forwarded`: the request comes from another machine through `ssh -A`.
+  /// The local process chain says nothing about it, so the sheet shows only
+  /// what is asked and where it came from, and it never reuses an approval.
+  init(data: Data, caller: Caller, key: Key, forwarded: Bool) {
+    let namespace: String? =
+      data.starts(with: Data("SSHSIG".utf8))
+      ? { var reader = SSHReader(data.dropFirst(6)); return (try? reader.text()) ?? "" }() : nil
+    let user = SignRequest.loginUser(data)
+
+    if forwarded {
+      let what =
+        namespace == "git" ? "sign a Git commit or tag"
+        : namespace.map { "sign data for \($0)" }
+        ?? user.map { "log in over SSH as \($0)" } ?? "sign SSH data"
+      action = Prompt.forwarded(caller, action: what, key: key)
+      reuseScope = nil
+      return
+    }
+
+    let instance = caller.appInstance.map { "\($0)\u{0}\(key.fingerprint)" }
+    if let namespace {
       guard namespace == "git" else {
         action = Prompt.lines("sign data for \(namespace)", [], key: key.promptLine)
         reuseScope = nil
@@ -257,19 +287,13 @@ struct SignRequest {
       return
     }
 
-    // SSH_MSG_USERAUTH_REQUEST publickey signature
-    var reader = SSHReader(data)
-    if (try? reader.string()) != nil, (try? reader.byte()) == 50,
-      let user = try? reader.text()
-    {
-      action = Prompt.sshLogin(caller, user: user, key: key, forwarded: forwarded)
-      let push = caller.push
-      // Forwarded requests come from another machine, and destructive
-      // pushes deserve their own look: always ask for those
-      let destructive = push.map { $0.force || $0.delete } ?? false
+    if let user {
+      action = Prompt.sshLogin(caller, user: user, key: key)
+      // Destructive pushes deserve their own look: always ask
+      let destructive = caller.push.map { $0.force || $0.delete } ?? false
       let host = caller.sshEndpoint.map { "\(user)@\($0.host):\($0.port)" }
       reuseScope =
-        forwarded || destructive ? nil : instance.flatMap { i in host.map { "\(i)\u{0}login\u{0}\($0)" } }
+        destructive ? nil : instance.flatMap { i in host.map { "\(i)\u{0}login\u{0}\($0)" } }
       return
     }
     action = Prompt.lines("sign SSH data", [("🔧", caller.initiatorLabel)], key: key.promptLine)
