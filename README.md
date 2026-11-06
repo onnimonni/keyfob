@@ -171,6 +171,39 @@ cosmetic: any program can name its executable anything. The real story is in
 `~/Library/Logs/keyfob.log`, which records each request, its outcome (`allowed`,
 `reused`, `denied`) and the full process chain (pids and command lines).
 
+## sudo
+
+`lib/pam/pam_keyfob.so` (in the nix package; `.build/release/libpam_keyfob.dylib`
+from `swift build`) replaces the generic "sudo is trying to execute a command as
+administrator" with what runs, where, and who asked:
+
+```
+sudo is trying to run as root:
+🔧 brew install foo
+📁 ~/Projects
+🤖 requested by claude.
+```
+
+Add it as `sufficient` at the top of `/etc/pam.d/sudo_local`, so denying,
+cancelling or any error falls through to the next line and sudo keeps working:
+
+```
+auth       sufficient     /path/to/pam_keyfob.so
+auth       sufficient     pam_tid.so
+```
+
+With nix-darwin:
+
+```nix
+security.pam.services.sudo_local.text = lib.mkBefore ''
+  auth       sufficient     ${inputs.keyfob.packages.${pkgs.system}.default}/lib/pam/pam_keyfob.so
+'';
+```
+
+Each approval or denial is appended to `~/Library/Logs/keyfob.log`. The sheet
+title stays "sudo": sudo is what asks. `sudo -A` (askpass) is left to the next
+module.
+
 ## Files
 
 `~/.config/keyfob` (`$KEYFOB_HOME` overrides):

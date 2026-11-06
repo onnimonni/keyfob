@@ -24,6 +24,8 @@ stdenv.mkDerivation {
     # Multicall: git looks for git-credential-<helper>, age for age-plugin-<name>
     ln -s keyfob $out/bin/git-credential-keyfob
     ln -s keyfob $out/bin/age-plugin-se
+    # sudo PAM module (see README)
+    install -Dm444 "$(swiftpmBinPath)/libpam_keyfob.dylib" $out/lib/pam/pam_keyfob.so
     runHook postInstall
   '';
 
