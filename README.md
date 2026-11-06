@@ -71,45 +71,99 @@ remember one approval for a few minutes, but only for the same scope:
 
 ## Install
 
-### Nix + home-manager
+Requires macOS 26 and a Mac with Touch ID (or a Magic Keyboard with Touch ID).
+Every install gives three commands (`keyfob`, `git-credential-keyfob`,
+`age-plugin-se`) and the sudo module `lib/pam/pam_keyfob.so`. Then, once per
+Mac and user:
+
+```sh
+keyfob init                   # 'default' SSH and age keys, git credentials key
+```
+
+and add `~/.config/keyfob/ssh/default.pub` to GitHub twice: as an
+authentication key and as a signing key.
+
+### nix-darwin + home-manager
 
 ```nix
 # flake.nix
-inputs.keyfob.url = "github:onnimonni/keyfob";
+inputs.keyfob = {
+  url = "github:onnimonni/keyfob";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
 
-# home-manager config
-imports = [ inputs.keyfob.homeManagerModules.default ];
+# nix-darwin: package and sudo
+imports = [ inputs.keyfob.darwinModules.default ];
 programs.keyfob = {
   enable = true;
-  # sshAgent = true;   # launchd agent + SSH_AUTH_SOCK (default)
-  # sshConfig = true;  # Include in ~/.ssh/config (default: programs.ssh.enable)
-  # git = true;        # include signing + credential config (default: programs.git.enable)
-  # sops = true;       # SOPS_AGE_KEY_FILE = the 'default' age key
+  sudo = true;   # sudo Touch ID sheet names the command (see "sudo")
+};
+
+# home-manager: per-user agent and config
+home-manager.users.me = {
+  imports = [ inputs.keyfob.homeManagerModules.default ];
+  programs.keyfob = {
+    enable = true;
+    # sshAgent = true;   # launchd agent + SSH_AUTH_SOCK (default)
+    # sshConfig = true;  # Include in ~/.ssh/config (default: programs.ssh.enable)
+    # git = true;        # signing + credential helper (default: programs.git.enable)
+    # sops = true;       # SOPS_AGE_KEY_FILE = the 'default' age key
+  };
 };
 ```
 
-Then once per Mac:
+home-manager alone (no nix-darwin) works the same; only `sudo` needs
+nix-darwin. Without either: `nix profile install github:onnimonni/keyfob`.
+
+`age-plugin-se` is part of keyfob: remove the separate `age-plugin-se` package.
+
+### Homebrew
 
 ```sh
-keyfob init
-```
-
-### Without nix
-
-```sh
-swift build -c release
-install -m755 .build/release/keyfob /usr/local/bin/keyfob
-ln -s keyfob /usr/local/bin/git-credential-keyfob
-ln -s keyfob /usr/local/bin/age-plugin-se
-keyfob init                   # keys and config snippets
-keyfob install-launch-agent   # agent at login
+brew tap onnimonni/keyfob https://github.com/onnimonni/keyfob
+brew install keyfob           # builds from source with the Command Line Tools
+brew services start keyfob    # the agent, at login
 keyfob install-ssh-config     # plain `ssh` uses the agent
+git config --global include.path ~/.config/keyfob/gitconfig
 ```
 
-`keyfob install-ssh-config` puts `Include ~/.config/keyfob/ssh_config` at the
-top of `~/.ssh/config` (so its `IdentityAgent` wins over later ones), once,
-keeping a backup. It refuses a symlinked config (nix, dotfiles): add the line
-there, or use the home-manager `sshConfig` option.
+For sudo, add to the top of `/etc/pam.d/sudo_local`:
+`auth sufficient /opt/homebrew/lib/pam/pam_keyfob.so`.
+It conflicts with Homebrew's `age-plugin-se` formula, which keyfob replaces.
+
+### make (manual)
+
+```sh
+make && sudo make install          # /usr/local/bin, /usr/local/lib/pam
+make install PREFIX=$HOME/.local   # without sudo
+keyfob install-launch-agent        # the agent, at login
+keyfob install-ssh-config
+git config --global include.path ~/.config/keyfob/gitconfig
+```
+
+`sudo make uninstall` removes it again (keys in `~/.config/keyfob` stay).
+
+### MDM / installer package
+
+```sh
+make pkg                                                  # unsigned
+make pkg PKG_SIGN="Developer ID Installer: Org (TEAMID)"  # signed, for MDM
+```
+
+builds `.build/keyfob-VERSION.pkg`, installing into `/usr/local`. Pair it with
+a login script running `keyfob install-launch-agent`, `keyfob
+install-ssh-config` and the git include for each user, and ship
+`/etc/pam.d/sudo_local` with the pam_keyfob line from your MDM. Users run
+`keyfob init` themselves: the keys are created in their Mac's Secure Enclave
+and never leave it. (Built from a shell that marks files with
+`com.apple.provenance`, the payload lists harmless `._` entries.)
+
+### What `install-ssh-config` does
+
+It puts `Include ~/.config/keyfob/ssh_config` at the top of `~/.ssh/config`
+(so its `IdentityAgent` wins over later ones), once, keeping a backup. It
+refuses a symlinked config (nix, dotfiles): add the line there, or use the
+home-manager `sshConfig` option.
 
 ## Usage
 
@@ -192,13 +246,8 @@ auth       sufficient     /path/to/pam_keyfob.so
 auth       sufficient     pam_tid.so
 ```
 
-With nix-darwin:
-
-```nix
-security.pam.services.sudo_local.text = lib.mkBefore ''
-  auth       sufficient     ${inputs.keyfob.packages.${pkgs.system}.default}/lib/pam/pam_keyfob.so
-'';
-```
+With nix-darwin, `programs.keyfob.sudo = true;` from `darwinModules.default`
+(see Install) does this, keeping `pam_reattach` first when enabled.
 
 Each approval or denial is appended to `~/Library/Logs/keyfob.log`. The sheet
 title stays "sudo": sudo is what asks. `sudo -A` (askpass) is left to the next

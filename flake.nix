@@ -19,6 +19,7 @@
       });
 
       homeManagerModules.default = import ./home-manager.nix self;
+      darwinModules.default = import ./darwin-module.nix self;
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
